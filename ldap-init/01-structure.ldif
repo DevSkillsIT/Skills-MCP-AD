@@ -1,0 +1,126 @@
+# Create organizational units for test structure
+dn: ou=people,dc=test,dc=local
+objectClass: organizationalUnit
+ou: people
+description: Test Users Container
+
+dn: ou=groups,dc=test,dc=local
+objectClass: organizationalUnit
+ou: groups
+description: Test Groups Container
+
+dn: ou=computers,dc=test,dc=local
+objectClass: organizationalUnit
+ou: computers
+description: Test Computers Container
+
+# Create test users
+dn: cn=John Doe,ou=people,dc=test,dc=local
+objectClass: inetOrgPerson
+objectClass: posixAccount
+objectClass: shadowAccount
+cn: John Doe
+sn: Doe
+givenName: John
+uid: jdoe
+uidNumber: 1001
+gidNumber: 1001
+homeDirectory: /home/jdoe
+userPassword: {SSHA}Password123!
+mail: jdoe@test.local
+description: Test User John Doe
+
+dn: cn=Jane Smith,ou=people,dc=test,dc=local
+objectClass: inetOrgPerson
+objectClass: posixAccount
+objectClass: shadowAccount
+cn: Jane Smith
+sn: Smith
+givenName: Jane
+uid: jsmith
+uidNumber: 1002
+gidNumber: 1001
+homeDirectory: /home/jsmith
+userPassword: {SSHA}Password123!
+mail: jsmith@test.local
+description: Test User Jane Smith
+
+dn: cn=Mike Wilson,ou=people,dc=test,dc=local
+objectClass: inetOrgPerson
+objectClass: posixAccount
+objectClass: shadowAccount
+cn: Mike Wilson
+sn: Wilson
+givenName: Mike
+uid: mwilson
+uidNumber: 1003
+gidNumber: 1001
+homeDirectory: /home/mwilson
+userPassword: {SSHA}Password123!
+mail: mwilson@test.local
+description: Test User Mike Wilson
+
+dn: cn=Test Admin,ou=people,dc=test,dc=local
+objectClass: inetOrgPerson
+objectClass: posixAccount
+objectClass: shadowAccount
+cn: Test Admin
+sn: Admin
+givenName: Test
+uid: testadmin
+uidNumber: 1004
+gidNumber: 1001
+homeDirectory: /home/testadmin
+userPassword: {SSHA}Admin123!
+mail: testadmin@test.local
+description: Test Administrator
+
+# Create test groups
+dn: cn=IT Department,ou=groups,dc=test,dc=local
+objectClass: groupOfNames
+cn: IT Department
+description: IT Department staff
+member: cn=Test Admin,ou=people,dc=test,dc=local
+
+dn: cn=Sales Team,ou=groups,dc=test,dc=local
+objectClass: groupOfNames
+cn: Sales Team
+description: Sales team members
+member: cn=John Doe,ou=people,dc=test,dc=local
+member: cn=Jane Smith,ou=people,dc=test,dc=local
+
+dn: cn=Marketing,ou=groups,dc=test,dc=local
+objectClass: groupOfNames
+cn: Marketing
+description: Marketing team
+member: cn=Mike Wilson,ou=people,dc=test,dc=local
+
+dn: cn=All Users,ou=groups,dc=test,dc=local
+objectClass: groupOfNames
+cn: All Users
+description: All domain users
+member: cn=John Doe,ou=people,dc=test,dc=local
+member: cn=Jane Smith,ou=people,dc=test,dc=local
+member: cn=Mike Wilson,ou=people,dc=test,dc=local
+member: cn=Test Admin,ou=people,dc=test,dc=local
+
+dn: cn=Domain Admins,ou=groups,dc=test,dc=local
+objectClass: groupOfNames
+cn: Domain Admins
+description: Domain administrators
+member: cn=Test Admin,ou=people,dc=test,dc=local
+
+# Create test computers
+dn: cn=TEST-PC01,ou=computers,dc=test,dc=local
+objectClass: device
+objectClass: ieee802Device
+cn: TEST-PC01
+description: Test workstation
+macAddress: 00:11:22:33:44:55
+
+dn: cn=TEST-SERVER01,ou=computers,dc=test,dc=local
+objectClass: device
+objectClass: ieee802Device
+cn: TEST-SERVER01
+description: Test server
+macAddress: 00:11:22:33:44:66

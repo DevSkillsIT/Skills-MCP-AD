@@ -1,0 +1,14 @@
+{
+    "mcpServers": {
+        "ActiveDirectoryMCP-OpenLDAP": {
+            "transport": {
+                "type": "http",
+                "url": "http://localhost:8813/activedirectory-mcp"
+            },
+            "description": "Active Directory MCP Server with LDAP Test Environment",
+            "env": {
+                "AD_MCP_CONFIG": "/media/workspace/ActiveDirectoryMCP/ad-config/ad-config.json"
+            }
+        }
+    }
+}

@@ -1,0 +1,77 @@
+# Docker Compose for Samba Active Directory Domain Controller
+# Provides a real Active Directory environment for testing
+
+services:
+  openldap-ad:
+    image: osixia/openldap:latest
+    container_name: openldap-ad-dc
+    hostname: dc
+    domainname: test.local
+    environment:
+      LDAP_ORGANISATION: "Test Organization"
+      LDAP_DOMAIN: "test.local"
+      LDAP_ADMIN_PASSWORD: "Admin123!"
+      LDAP_CONFIG_PASSWORD: "Admin123!"
+      LDAP_READONLY_USER: "false"
+      LDAP_RFC2307BIS_SCHEMA: "true"
+      LDAP_BACKEND: "mdb"
+      LDAP_TLS: "false"
+      LDAP_REPLICATION: "false"
+      KEEP_EXISTING_CONFIG: "false"
+      LDAP_REMOVE_CONFIG_AFTER_SETUP: "true"
+    ports:
+      - "389:389"
+      - "636:636"
+    volumes:
+      - openldap-data:/var/lib/ldap
+      - openldap-config:/etc/ldap/slapd.d
+      - ./ldap-init:/container/service/slapd/assets/config/bootstrap/ldif/custom
+    command: ["--copy-service"]
+    networks:
+      ad-network:
+        ipv4_address: 192.168.1.100
+    restart: unless-stopped
+
+  # ActiveDirectory MCP Server for testing
+  activedirectory-mcp:
+    build: .
+    container_name: activedirectory-mcp-test
+    depends_on:
+      - openldap-ad
+    environment:
+      - AD_MCP_CONFIG=/app/ad-config/ad-config.json
+      - HTTP_HOST=0.0.0.0
+      - HTTP_PORT=8813
+      - HTTP_PATH=/activedirectory-mcp
+    ports:
+      - "8813:8813"
+    volumes:
+      - ./ad-config:/app/ad-config:ro
+    networks:
+      - ad-network
+    restart: unless-stopped
+
+  # phpLDAPadmin for web management
+  ldap-admin:
+    image: osixia/phpldapadmin:0.9.0
+    container_name: openldap-admin
+    environment:
+      PHPLDAPADMIN_LDAP_HOSTS: openldap-ad
+      PHPLDAPADMIN_HTTPS: "false"
+    ports:
+      - "8080:80"
+    depends_on:
+      - openldap-ad
+    networks:
+      - ad-network
+
+volumes:
+  openldap-data:
+  openldap-config:
+
+networks:
+  ad-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.1.0/24

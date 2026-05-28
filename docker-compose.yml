@@ -1,0 +1,64 @@
+# Docker Compose for Production Deployment
+# Deploys only ActiveDirectoryMCP server to connect to existing AD infrastructure
+
+services:
+  activedirectory-mcp:
+    build: .
+    container_name: activedirectory-mcp
+    environment:
+      # Configuration file path
+      - AD_MCP_CONFIG=/app/ad-config/ad-config.json
+      
+      # HTTP server settings
+      - HTTP_HOST=0.0.0.0
+      - HTTP_PORT=8813
+      - HTTP_PATH=/activedirectory-mcp
+      
+      # Optional: Override config via environment variables
+      # - AD_SERVER=ldap://your-ad-server.domain.com:389
+      # - AD_BIND_DN=CN=ServiceAccount,OU=Service Accounts,DC=domain,DC=com
+      # - AD_PASSWORD=YourSecurePassword
+      # - AD_BASE_DN=DC=domain,DC=com
+      
+    ports:
+      - "8813:8813"
+      
+    volumes:
+      # Mount configuration directory
+      - ./ad-config:/app/ad-config:ro
+      
+      # Optional: Mount custom SSL certificates
+      # - ./ssl:/app/ssl:ro
+      
+    restart: unless-stopped
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(1); result=s.connect_ex(('localhost',8813)); s.close(); exit(result)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+    # Resource limits for production
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
+        reservations:
+          memory: 256M
+          cpus: "0.25"
+    
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Optional: External network for connecting to existing infrastructure
+# networks:
+#   default:
+#     external: true
+#     name: your-existing-network
