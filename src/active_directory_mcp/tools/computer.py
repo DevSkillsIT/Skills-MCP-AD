@@ -586,11 +586,14 @@ class ComputerTools(BaseTool):
         last_logon = self._get_attr(attributes, 'lastLogon', 0)
         if last_logon == 0 or last_logon is None:
             return None
-        
+
         try:
             last_logon_date = self._convert_filetime_to_datetime(last_logon)
-            return (datetime.now() - last_logon_date).days
-        except:
+            if last_logon_date is None or last_logon_date.year <= 1601:
+                return None
+            now = datetime.now(last_logon_date.tzinfo) if last_logon_date.tzinfo else datetime.now()
+            return (now - last_logon_date).days
+        except Exception:
             return None
     
     def _get_password_age_days(self, attributes: Dict[str, Any]) -> Optional[int]:
@@ -598,11 +601,14 @@ class ComputerTools(BaseTool):
         pwd_last_set = self._get_attr(attributes, 'pwdLastSet', 0)
         if pwd_last_set == 0:
             return None
-        
+
         try:
             pwd_date = self._convert_filetime_to_datetime(pwd_last_set)
-            return (datetime.now() - pwd_date).days
-        except:
+            if pwd_date is None:
+                return None
+            now = datetime.now(pwd_date.tzinfo) if pwd_date.tzinfo else datetime.now()
+            return (now - pwd_date).days
+        except Exception:
             return None
     
     def _convert_filetime_to_datetime(self, filetime) -> datetime:
@@ -714,8 +720,8 @@ class ComputerTools(BaseTool):
                 
             # Extract attributes
             attributes = computer_info.get('attributes', {})
-            member_of = attributes.get('memberOf', [])
-            
+            member_of = self._get_attr_list(attributes, 'memberOf')
+
             groups = []
             for group_dn in member_of:
                 # Extract group name from DN

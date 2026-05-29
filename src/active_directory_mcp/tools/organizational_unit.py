@@ -202,13 +202,16 @@ class OrganizationalUnitTools(BaseTool):
             
             # Build DN
             ou_dn = f"OU={name},{parent_ou}"
-            
-            # Check if OU already exists
+
+            # Check if OU already exists by searching the PARENT container.
+            # Searching with search_base=ou_dn would raise NO_OBJECT when the OU
+            # does not exist yet, so we query the parent and filter by name.
+            escaped_name = self._escape_ldap_filter(name)
             existing_ou = self.ldap.search(
-                search_base=ou_dn,
-                search_filter="(objectClass=organizationalUnit)",
+                search_base=parent_ou,
+                search_filter=f"(&(objectClass=organizationalUnit)(ou={escaped_name}))",
                 attributes=['name'],
-                search_scope=ldap3.BASE
+                search_scope=ldap3.LEVEL
             )
             
             if existing_ou:

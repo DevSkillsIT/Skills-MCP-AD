@@ -65,7 +65,7 @@ class GroupTools(BaseTool):
                     'displayName': self._get_attr(entry['attributes'], 'displayName', ''),
                     'description': self._get_attr(entry['attributes'], 'description', ''),
                     'groupType': self._get_attr(entry['attributes'], 'groupType', 0),
-                    'memberCount': len(entry['attributes'].get('member') or [])
+                    'memberCount': len(self._get_attr_list(entry['attributes'], 'member'))
                 }
                 
                 # Add group scope information
@@ -150,8 +150,8 @@ class GroupTools(BaseTool):
             group_info['computed'] = {
                 'scope': self._get_group_scope(group_type),
                 'type': self._get_group_type(group_type),
-                'member_count': len(group_entry['attributes'].get('member') or []),
-                'parent_groups_count': len(group_entry['attributes'].get('memberOf') or [])
+                'member_count': len(self._get_attr_list(group_entry['attributes'], 'member')),
+                'parent_groups_count': len(self._get_attr_list(group_entry['attributes'], 'memberOf'))
             }
             
             log_ldap_operation("get_group", group_name, True, f"Retrieved group: {group_entry['dn']}")
@@ -383,8 +383,8 @@ class GroupTools(BaseTool):
                 }, "add_member")
             
             group_dn = group_results[0]['dn']
-            current_members = group_results[0]['attributes'].get('member', [])
-            
+            current_members = self._get_attr_list(group_results[0]['attributes'], 'member')
+
             # Check if member is already in group
             if member_dn in current_members:
                 return self._format_response({
@@ -445,8 +445,8 @@ class GroupTools(BaseTool):
                 }, "remove_member")
             
             group_dn = group_results[0]['dn']
-            current_members = group_results[0]['attributes'].get('member', [])
-            
+            current_members = self._get_attr_list(group_results[0]['attributes'], 'member')
+
             # Check if member is in group
             if member_dn not in current_members:
                 return self._format_response({
@@ -507,8 +507,8 @@ class GroupTools(BaseTool):
                 }, "get_members")
             
             group_dn = group_results[0]['dn']
-            member_dns = group_results[0]['attributes'].get('member', [])
-            
+            member_dns = self._get_attr_list(group_results[0]['attributes'], 'member')
+
             members = []
             processed_groups = set()  # To avoid infinite recursion
             
@@ -540,7 +540,7 @@ class GroupTools(BaseTool):
                             # If recursive and this is a group, process its members
                             if recursive and 'group' in object_classes and member_dn not in processed_groups:
                                 processed_groups.add(member_dn)
-                                nested_members = member_data.get('member', [])
+                                nested_members = self._get_attr_list(member_data, 'member')
                                 if nested_members:
                                     process_members(nested_members, level + 1)
                         

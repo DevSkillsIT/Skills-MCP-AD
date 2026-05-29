@@ -100,7 +100,7 @@ class SecurityTools(BaseTool):
                     
                     if group_results:
                         group_entry = group_results[0]
-                        members = group_entry['attributes'].get('member') or []
+                        members = self._get_attr_list(group_entry['attributes'], 'member')
                         
                         # Handle bytes objects for JSON serialization
                         object_sid = self._get_attr(group_entry['attributes'], 'objectSid', b'')
@@ -164,8 +164,8 @@ class SecurityTools(BaseTool):
                 }, "get_user_permissions")
             
             user_entry = user_results[0]
-            member_of = user_entry['attributes'].get('memberOf') or []
-            
+            member_of = self._get_attr_list(user_entry['attributes'], 'memberOf')
+
             # Analyze group memberships
             group_analysis = []
             privileged_groups = []
@@ -273,20 +273,22 @@ class SecurityTools(BaseTool):
                 if last_logon == 0 or last_logon is None:
                     is_inactive = True
                 elif isinstance(last_logon, datetime):  # datetime object
-                    cutoff_date = datetime.now(last_logon.tzinfo) if last_logon.tzinfo else datetime.now() - timedelta(days=days)
+                    # Parentheses matter: subtract the window in BOTH branches.
+                    base_now = datetime.now(last_logon.tzinfo) if last_logon.tzinfo else datetime.now()
+                    cutoff_date = base_now - timedelta(days=days)
                     is_inactive = last_logon < cutoff_date
                 elif isinstance(last_logon, int) and last_logon < cutoff_filetime:
                     is_inactive = True
                 if is_inactive:
                     uac = self._get_attr(entry['attributes'], 'userAccountControl', 0)
-                    member_of = entry['attributes'].get('memberOf') or []
-                    
+                    member_of = self._get_attr_list(entry['attributes'], 'memberOf')
+
                     user_info = {
                         'dn': entry['dn'],
                         'sam_account_name': self._get_attr(entry['attributes'], 'sAMAccountName', ''),
                         'display_name': self._get_attr(entry['attributes'], 'displayName', ''),
                         'mail': self._get_attr(entry['attributes'], 'mail', ''),
-                        'last_logon': self._convert_filetime_to_datetime(last_logon) if (last_logon and not isinstance(last_logon, bool) and (isinstance(last_logon, datetime) or last_logon > 0)) else 'Never',
+                        'last_logon': self._logon_or_never(last_logon),
                         'days_inactive': self._get_days_since_last_logon({'lastLogon': [last_logon]}),
                         'enabled': not bool(uac & 0x0002),
                         'group_count': len(member_of),
@@ -418,8 +420,8 @@ class SecurityTools(BaseTool):
                     )
                     
                     if group_results:
-                        members = group_results[0]['attributes'].get('member') or []
-                        
+                        members = self._get_attr_list(group_results[0]['attributes'], 'member')
+
                         for member_dn in members:
                             # Get user details
                             user_results = self.ldap.search(
@@ -465,7 +467,7 @@ class SecurityTools(BaseTool):
                                     'mail': self._get_attr(user_entry['attributes'], 'mail', ''),
                                     'privileged_group': group_name,
                                     'enabled': not bool(uac & 0x0002),
-                                    'last_logon': self._convert_filetime_to_datetime(last_logon) if (last_logon and not isinstance(last_logon, bool) and (isinstance(last_logon, datetime) or last_logon > 0)) else 'Never',
+                                    'last_logon': self._logon_or_never(last_logon),
                                     'days_since_logon': days_since_logon,
                                     'logon_count': self._get_attr(user_entry['attributes'], 'logonCount', 0),
                                     'bad_pwd_count': self._get_attr(user_entry['attributes'], 'badPwdCount', 0),
@@ -489,9 +491,9 @@ class SecurityTools(BaseTool):
             return self._format_response({
                 "admin_accounts": admin_accounts,
                 "total_admin_accounts": len(admin_accounts),
-                "high_risk_count": len([acc for acc in admin_accounts if acc['risk_level'] == 'high']),
-                "medium_risk_count": len([acc for acc in admin_accounts if acc['risk_level'] == 'medium']),
-                "low_risk_count": len([acc for acc in admin_accounts if acc['risk_level'] == 'low'])
+                "high_risk_count": len([acc for acc in admin_accounts if str(acc['risk_level']).upper() == 'HIGH']),
+                "medium_risk_count": len([acc for acc in admin_accounts if str(acc['risk_level']).upper() == 'MEDIUM']),
+                "low_risk_count": len([acc for acc in admin_accounts if str(acc['risk_level']).upper() == 'LOW'])
             }, "audit_admin_accounts")
             
         except Exception as e:
@@ -628,16 +630,35 @@ class SecurityTools(BaseTool):
         delta = dt - epoch
         return int(delta.total_seconds() * 10000000)
     
+    def _logon_or_never(self, last_logon: Any) -> Any:
+        """Return a datetime for a real logon, or 'Never' for an unset value.
+
+        AD represents "never logged on" as 0, which ldap3 may surface either as
+        the int 0 or as datetime(1601, 1, 1). Both must render as 'Never'.
+        """
+        if not last_logon or isinstance(last_logon, bool):
+            return 'Never'
+        dt = last_logon if isinstance(last_logon, datetime) else self._convert_filetime_to_datetime(last_logon)
+        if dt is None or dt.year <= 1601:
+            return 'Never'
+        return dt
+
     def _get_days_since_last_logon(self, attributes: Dict[str, Any]) -> Optional[int]:
         """Get number of days since last logon."""
         last_logon = self._get_attr(attributes, 'lastLogon', 0)
-        if last_logon == 0:
+        if not last_logon or last_logon == 0:
             return None
-        
+
         try:
             last_logon_date = self._convert_filetime_to_datetime(last_logon)
-            return (datetime.now() - last_logon_date).days
-        except:
+            if last_logon_date is None or last_logon_date.year <= 1601:
+                # year <= 1601 is the AD "never logged on" epoch, not a real date.
+                return None
+            # Use a tz-aware "now" when the LDAP value is tz-aware to avoid
+            # "can't subtract offset-naive and offset-aware datetimes" TypeError.
+            now = datetime.now(last_logon_date.tzinfo) if last_logon_date.tzinfo else datetime.now()
+            return (now - last_logon_date).days
+        except Exception:
             return None
     
     # Additional methods for security testing
@@ -777,7 +798,7 @@ class SecurityTools(BaseTool):
         risk_score = 0
         
         # Check for admin privileges
-        member_of = account_data.get('memberOf') or []
+        member_of = self._get_attr_list(account_data, 'memberOf')
         admin_groups = ['Domain Admins', 'Enterprise Admins', 'Administrators']
         for group in member_of:
             if any(admin_group in group for admin_group in admin_groups):
@@ -817,8 +838,12 @@ class SecurityTools(BaseTool):
                 pwd_set_date = pwd_last_set
             else:
                 pwd_set_date = self._convert_filetime_to_datetime(pwd_last_set)
-            return (datetime.now() - pwd_set_date).days
-        except:
+            if pwd_set_date is None:
+                return -1
+            # tz-safe: match now() to the value's tzinfo to avoid naive/aware TypeError.
+            now = datetime.now(pwd_set_date.tzinfo) if pwd_set_date.tzinfo else datetime.now()
+            return (now - pwd_set_date).days
+        except Exception:
             return -1  # Test expects -1 for errors
 
     def generate_security_report(self) -> List[Dict[str, Any]]:

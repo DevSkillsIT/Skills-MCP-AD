@@ -156,7 +156,9 @@ class ClientRegistry:
         """
         clients = self.get_active_clients()
         if not clients:
-            return "Nenhum cliente AD configurado."
+            return ("Nenhum cliente multi-tenant configurado. "
+                    "O servidor pode estar operando em modo de instância única "
+                    "(consulte 'current_instance' para a instância ativa).")
         
         lines = ["Clientes com AD configurado:"]
         for slug, data in clients.items():

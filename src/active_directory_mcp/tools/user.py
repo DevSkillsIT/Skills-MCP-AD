@@ -250,13 +250,29 @@ class UserTools(BaseTool):
                     )
                     
                 except Exception as pwd_error:
-                    # If password setting fails, delete the created user
+                    # Password could not be set. The most common cause is an AD
+                    # password-policy rejection (length/complexity/history, or the
+                    # password contains part of the account name), which surfaces as
+                    # WILL_NOT_PERFORM (0x0000052D). Roll back the half-created
+                    # account so we never leave an orphan with no password.
+                    rolled_back = False
                     try:
                         self.ldap.delete(user_dn)
-                    except:
+                        rolled_back = True
+                    except Exception:
                         pass
-                    
-                    raise Exception(f"User created but password setting failed: {pwd_error}")
+
+                    err = str(pwd_error)
+                    if any(token in err for token in ('WILL_NOT_PERFORM', '0000052D', '5003')):
+                        reason = ("password rejected by Active Directory policy "
+                                  "(length/complexity/history, or it contains part of "
+                                  "the account name)")
+                    else:
+                        reason = f"failed to set password: {pwd_error}"
+
+                    cleanup = "account was rolled back" if rolled_back else \
+                        "WARNING: account could not be rolled back and may need manual cleanup"
+                    raise Exception(f"User '{username}' NOT created - {reason} ({cleanup})")
             else:
                 raise Exception("Failed to create user account")
             
@@ -508,8 +524,8 @@ class UserTools(BaseTool):
                 }, "get_user_groups")
             
             user_dn = user_results[0]['dn']
-            member_of = user_results[0]['attributes'].get('memberOf', [])
-            
+            member_of = self._get_attr_list(user_results[0]['attributes'], 'memberOf')
+
             # Get detailed group information
             groups = []
             for group_dn in member_of:

@@ -173,15 +173,18 @@ class BaseTool(ABC):
         Returns:
             Escaped value
         """
-        # Escape special LDAP filter characters
+        # Escape special LDAP filter characters.
+        # The backslash MUST be escaped first, otherwise the backslashes we
+        # introduce for the other replacements (\2a, \28, ...) would be
+        # re-escaped, corrupting the filter.
         escape_chars = {
+            '\\': r'\5c',
             '*': r'\2a',
             '(': r'\28',
             ')': r'\29',
-            '\\': r'\5c',
             '\x00': r'\00'
         }
-        
+
         for char, escaped in escape_chars.items():
             value = value.replace(char, escaped)
         
@@ -216,3 +219,26 @@ class BaseTool(ABC):
         if isinstance(value, list):
             return value[0] if value else default
         return value
+
+    def _get_attr_list(self, attributes: Dict, key: str) -> List[Any]:
+        """
+        Safely get a multivalued attribute as a list from an LDAP response.
+
+        ldap3 returns a multivalued attribute as a scalar (str) when it holds
+        exactly one value, as a list when it holds two or more, and may return
+        None when the attribute is present but empty. This normalizes all three
+        cases to a list so callers can safely iterate or call len().
+
+        Args:
+            attributes: Dict of attributes from LDAP response
+            key: Attribute name
+
+        Returns:
+            List of attribute values (empty list if missing/None)
+        """
+        value = attributes.get(key)
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        return [value]
