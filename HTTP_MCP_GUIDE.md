@@ -7,8 +7,8 @@ This guide shows how to run the Active Directory MCP server over Streamable HTTP
 ### Docker Compose
 
 ```bash
-git clone https://github.com/DevSkillsIT/Skills-MCP-AD.git
-cd Skills-MCP-AD
+git clone https://github.com/DevSkillsIT/Skills-MCP-Active-Directory.git
+cd Skills-MCP-Active-Directory
 
 # Create your real config from the template
 cp ad-config/ad-config.example.json /etc/ad-mcp/ad-config.json

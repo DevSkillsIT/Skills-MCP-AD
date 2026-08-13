@@ -5,9 +5,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/DevSkillsIT/Skills-MCP-AD/stargazers"><img src="https://img.shields.io/github/stars/DevSkillsIT/Skills-MCP-AD?style=for-the-badge&color=000cd9" alt="Stars"/></a>
-  <a href="https://github.com/DevSkillsIT/Skills-MCP-AD/network/members"><img src="https://img.shields.io/github/forks/DevSkillsIT/Skills-MCP-AD?style=for-the-badge&color=0a2463" alt="Forks"/></a>
-  <a href="https://github.com/DevSkillsIT/Skills-MCP-AD/issues"><img src="https://img.shields.io/github/issues/DevSkillsIT/Skills-MCP-AD?style=for-the-badge&color=faad14" alt="Issues"/></a>
+  <a href="https://github.com/DevSkillsIT/Skills-MCP-Active-Directory/stargazers"><img src="https://img.shields.io/github/stars/DevSkillsIT/Skills-MCP-Active-Directory?style=for-the-badge&color=000cd9" alt="Stars"/></a>
+  <a href="https://github.com/DevSkillsIT/Skills-MCP-Active-Directory/network/members"><img src="https://img.shields.io/github/forks/DevSkillsIT/Skills-MCP-Active-Directory?style=for-the-badge&color=0a2463" alt="Forks"/></a>
+  <a href="https://github.com/DevSkillsIT/Skills-MCP-Active-Directory/issues"><img src="https://img.shields.io/github/issues/DevSkillsIT/Skills-MCP-Active-Directory?style=for-the-badge&color=faad14" alt="Issues"/></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-52c41a?style=for-the-badge" alt="License"/></a>
 </p>
 
@@ -81,8 +81,8 @@ Each `start.sh` exports `AD_MCP_CONFIG` pointing at that tenant's config and run
 ### 1. Install
 
 ```bash
-git clone https://github.com/DevSkillsIT/Skills-MCP-AD.git
-cd Skills-MCP-AD
+git clone https://github.com/DevSkillsIT/Skills-MCP-Active-Directory.git
+cd Skills-MCP-Active-Directory
 
 python -m venv .venv
 source .venv/bin/activate          # Linux/macOS
@@ -342,5 +342,5 @@ MIT &mdash; see [LICENSE](LICENSE).
 
 ## Support
 
-- Bug reports: [GitHub Issues](https://github.com/DevSkillsIT/Skills-MCP-AD/issues)
-- Discussions: [GitHub Discussions](https://github.com/DevSkillsIT/Skills-MCP-AD/discussions)
+- Bug reports: [GitHub Issues](https://github.com/DevSkillsIT/Skills-MCP-Active-Directory/issues)
+- Discussions: [GitHub Discussions](https://github.com/DevSkillsIT/Skills-MCP-Active-Directory/discussions)
