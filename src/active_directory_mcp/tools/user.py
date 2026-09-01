@@ -183,8 +183,7 @@ class UserTools(BaseTool):
         try:
             # Determine OU
             if ou is None:
-                # Default to CN=Users under base DN if organizational_units not configured
-                ou = f"CN=Users,{self.ldap.ad_config.base_dn}"
+                ou = self._default_ou("users")
             
             # Build DN
             user_dn = f"CN={first_name} {last_name},{ou}"
@@ -651,22 +650,28 @@ class UserTools(BaseTool):
         return bool(uac_value & 0x0010)  # Check LOCKOUT flag
     
     def _is_password_expired(self, attributes: Dict[str, Any]) -> bool:
-        """Check if user password is expired."""
-        pwd_last_set = self._get_attr(attributes, 'pwdLastSet', 0)
-        return pwd_last_set == 0
-    
+        """Check whether the user must change the password at next logon.
+
+        AD encodes that as pwdLastSet = 0. ldap3 surfaces it either as the int 0
+        or as datetime(1601, 1, 1); comparing the raw value against 0 answered
+        False for the datetime form, contradicting
+        ad_get_password_policy_violations about the very same user.
+        """
+        return self._as_filetime(self._get_attr(attributes, 'pwdLastSet', 0)) == 0
+
     def _is_account_expired(self, attributes: Dict[str, Any]) -> bool:
-        """Check if user account is expired."""
-        account_expires = self._get_attr(attributes, 'accountExpires', 0)
-        if account_expires == 0 or account_expires == 9223372036854775807:  # Never expires
+        """Check whether the account expiry date is in the past.
+
+        The previous version divided the raw value by 10, which raises TypeError
+        for the datetime form ldap3 actually returns; a bare except then turned
+        every expired account into "not expired". Measured on production: an
+        account expired in 2018 reported account_expired=False.
+        """
+        account_expires = self._as_filetime(
+            self._get_attr(attributes, 'accountExpires', 0))
+        if account_expires == 0 or account_expires >= self._never_expires_floor():
             return False
-        
-        # Convert Windows timestamp to datetime
-        try:
-            expire_date = datetime(1601, 1, 1) + timedelta(microseconds=account_expires / 10)
-            return expire_date < datetime.now()
-        except:
-            return False
+        return account_expires < self._now_filetime()
     
     def get_schema_info(self) -> Dict[str, Any]:
         """Get schema information for user operations."""

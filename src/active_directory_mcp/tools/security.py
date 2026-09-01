@@ -1,7 +1,7 @@
 """Security and audit tools for Active Directory."""
 
 from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import base64
 
 import ldap3
@@ -332,7 +332,11 @@ class SecurityTools(BaseTool):
             if not domain_results:
                 raise Exception("Could not retrieve domain password policy")
             
-            max_pwd_age = domain_results[0]['attributes'].get('maxPwdAge', [0])[0]
+            # Indexing the raw value with [0] made this tool fail on every domain:
+            # ldap3 hands over a timedelta here, not a list.
+            max_pwd_age = self._as_filetime(
+                self._get_attr(domain_results[0]['attributes'], 'maxPwdAge', 0)
+            )
             
             # Search for users
             user_results = self.ldap.search(
@@ -345,12 +349,16 @@ class SecurityTools(BaseTool):
             )
             
             violations = []
-            current_time = self._convert_datetime_to_filetime(datetime.now())
+            # AD stores these timestamps in UTC; comparing against local time
+            # would shift every deadline by the machine's offset.
+            current_time = self._now_filetime()
             
             for entry in user_results:
                 uac = self._get_attr(entry['attributes'], 'userAccountControl', 0)
-                pwd_last_set = self._get_attr(entry['attributes'], 'pwdLastSet', 0)
-                account_expires = self._get_attr(entry['attributes'], 'accountExpires', 0)
+                pwd_last_set = self._as_filetime(
+                    self._get_attr(entry['attributes'], 'pwdLastSet', 0))
+                account_expires = self._as_filetime(
+                    self._get_attr(entry['attributes'], 'accountExpires', 0))
                 
                 user_violations = []
                 
@@ -579,9 +587,14 @@ class SecurityTools(BaseTool):
         }
     
     def _calculate_admin_risk_level(self, security_issues: List[str], days_since_logon: Optional[int]) -> str:
-        """Calculate risk level for admin accounts."""
+        """Calculate risk level for admin accounts.
+
+        Lowercase to match get_schema_info's advertised risk_levels and the
+        other producer in this file. The counters in audit_admin_accounts
+        already normalize with .upper(), so they keep working.
+        """
         if not security_issues:
-            return "LOW"
+            return "low"
         
         high_risk_issues = [
             "Password not required",
@@ -594,22 +607,30 @@ class SecurityTools(BaseTool):
         
         # Check for high risk issues
         if any(issue in security_issues for issue in high_risk_issues):
-            return "HIGH"
+            return "high"
         
         # Check for medium risk issues or long inactivity
         if (any(issue in security_issues for issue in medium_risk_issues) or
             (days_since_logon and days_since_logon > 180)):
-            return "HIGH"
+            return "high"
         elif days_since_logon and days_since_logon > 90:
-            return "MEDIUM"
+            return "medium"
         
-        return "MEDIUM" if security_issues else "LOW"
+        return "medium" if security_issues else "low"
     
     def _get_security_recommendation(self, risk_level: str, risk_factors: List[str]) -> str:
-        """Get security recommendation based on risk assessment."""
-        if risk_level == "HIGH":
+        """Get security recommendation based on risk assessment.
+
+        @MX:ANCHOR The level arrives from two producers that disagreed on case
+        (_assess_user_security emits lowercase, _calculate_admin_risk_level used
+        to emit uppercase). Comparing the raw string silently handed the
+        low-risk advice to every high-risk account, so normalize here and never
+        compare the raw value.
+        """
+        nivel = str(risk_level).strip().upper()
+        if nivel == "HIGH":
             return "Immediate action required: Review and remediate high-risk security issues"
-        elif risk_level == "MEDIUM":
+        elif nivel == "MEDIUM":
             return "Review account permissions and consider implementing additional security controls"
         else:
             return "Monitor account activity and maintain current security posture"
@@ -627,8 +648,12 @@ class SecurityTools(BaseTool):
     def _convert_datetime_to_filetime(self, dt: datetime) -> int:
         """Convert datetime to Windows FILETIME."""
         epoch = datetime(1601, 1, 1)
+        if dt.tzinfo is not None:
+            # The 1601 epoch is naive; an aware datetime would raise on subtraction.
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
         delta = dt - epoch
         return int(delta.total_seconds() * 10000000)
+
     
     def _logon_or_never(self, last_logon: Any) -> Any:
         """Return a datetime for a real logon, or 'Never' for an unset value.
@@ -695,103 +720,17 @@ class SecurityTools(BaseTool):
                 compliance['policy_compliant'] = False
                 compliance['recommendations'].append('Increase password history to at least 5 passwords')
                 
-            return self._format_response(True, compliance)
+            # Arguments were swapped: _format_response(data, operation) was
+            # called as (True, compliance), so the tool answered the string
+            # "True" and threw the compliance report away.
+            return self._format_response(compliance, "check_password_policy")
             
         except Exception as e:
             return self._handle_ldap_error(e, 'check_password_policy', 'domain')
     
-    def find_weak_passwords(self) -> List[Dict[str, Any]]:
-        """Find users with weak passwords (mock implementation)."""
-        try:
-            # This is a mock since we can't actually check password strength
-            weak_accounts = [
-                {
-                    'username': 'testuser1',
-                    'dn': 'CN=Test User 1,OU=Users,DC=test,DC=local',
-                    'risk_level': 'high',
-                    'issues': ['Password never changed', 'Account has admin privileges']
-                },
-                {
-                    'username': 'service_account',
-                    'dn': 'CN=Service Account,OU=Service Accounts,DC=test,DC=local',
-                    'risk_level': 'medium',
-                    'issues': ['Password older than 90 days']
-                }
-            ]
-            
-            return self._format_response({
-                'weak_accounts': weak_accounts,
-                'total_found': len(weak_accounts),
-                'scan_method': 'policy_analysis'  # Cannot scan actual passwords
-            }, "find_weak_passwords")
-            
-        except Exception as e:
-            return self._handle_ldap_error(e, 'find_weak_passwords', 'domain')
     
-    def analyze_permissions(self, target_dn: str) -> List[Dict[str, Any]]:
-        """Analyze permissions for a specific object."""
-        try:
-            # Mock permission analysis
-            permissions_analysis = {
-                'target_dn': target_dn,
-                'permissions': [
-                    {'principal': 'Domain Admins', 'access': 'Full Control', 'inherited': True},
-                    {'principal': 'Authenticated Users', 'access': 'Read', 'inherited': True}
-                ],
-                'security_issues': [],
-                'recommendations': ['Review inherited permissions', 'Consider explicit deny rules']
-            }
-            
-            return self._format_response(permissions_analysis, "analyze_permissions")
-            
-        except Exception as e:
-            return self._handle_ldap_error(e, 'analyze_permissions', target_dn)
     
-    def detect_privilege_escalation(self, hours_back: int = 24) -> List[Dict[str, Any]]:
-        """Detect potential privilege escalation events."""
-        try:
-            # Mock detection - in real implementation would check event logs
-            escalation_events = [
-                {
-                    'event_time': datetime.now() - timedelta(hours=2),
-                    'user': 'testuser',
-                    'action': 'Added to privileged group',
-                    'group': 'Account Operators',
-                    'risk_level': 'medium'
-                }
-            ]
-            
-            return self._format_response({
-                'escalation_events': escalation_events,
-                'total_events': len(escalation_events),
-                'time_range_hours': hours_back
-            }, "detect_privilege_escalation")
-            
-        except Exception as e:
-            return self._handle_ldap_error(e, 'detect_privilege_escalation', 'domain')
     
-    def check_service_accounts(self) -> List[Dict[str, Any]]:
-        """Check service accounts for security issues."""
-        try:
-            # Mock service account analysis
-            service_accounts = [
-                {
-                    'username': 'svc_backup',
-                    'dn': 'CN=Backup Service,OU=Service Accounts,DC=test,DC=local',
-                    'issues': ['Password never expires', 'Member of privileged groups'],
-                    'last_logon': '30+ days ago',
-                    'risk_level': 'high'
-                }
-            ]
-            
-            return self._format_response({
-                'service_accounts': service_accounts,
-                'total_accounts': len(service_accounts),
-                'high_risk_count': 1
-            }, "check_service_accounts")
-            
-        except Exception as e:
-            return self._handle_ldap_error(e, 'check_service_accounts', 'domain')
     
     def _assess_account_risk(self, account_data: Dict[str, Any]) -> str:
         """Assess risk level of an account."""

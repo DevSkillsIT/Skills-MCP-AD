@@ -183,7 +183,7 @@ class GroupTools(BaseTool):
         try:
             # Determine OU
             if ou is None:
-                ou = self.ldap.ad_config.organizational_units.groups_ou
+                ou = self._default_ou("groups")
             
             # Use display_name if provided, otherwise use group_name
             if display_name is None:

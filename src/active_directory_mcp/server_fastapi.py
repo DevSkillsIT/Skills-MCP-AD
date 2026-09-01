@@ -15,9 +15,9 @@ import logging
 import asyncio
 import uuid
 import signal
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 from fastapi import FastAPI, HTTPException, Request, Header, Depends
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -25,10 +25,12 @@ from pydantic import BaseModel, Field
 import uvicorn
 
 from .config.loader import load_config, validate_config
+from .config.models import LoggingConfig
+from .config.multi_loader import load_multi_config, MultiConfigError
+from .core.ad_pool import ADServerPool
 from .core.logging import setup_logging
 from .core.ldap_manager import LDAPManager
 from .core.client_security import init_security_manager
-from .core.client_registry import get_client_registry, list_configured_clients as registry_list_clients
 from .tools.user import UserTools
 from .tools.group import GroupTools
 from .tools.computer import ComputerTools
@@ -62,7 +64,7 @@ mcp_sessions: Dict[str, Dict] = {}
 
 def cleanup_expired_sessions():
     """Remove sessions older than 15 minutes."""
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     expired = [
         sid for sid, data in mcp_sessions.items()
         if (now - data.get("created_at", now)).total_seconds() > 900
@@ -122,18 +124,61 @@ class ActiveDirectoryMCPFastAPI:
     - Full AD management operations
     """
 
+    # Tools that do not target one directory and therefore take no ad_server.
+    _GLOBAL_TOOLS = (
+        "ad_list_ad_servers",
+        "ad_check_ad_server_configured",
+        "ad_list_configured_clients",
+        "ad_check_client_configuration",
+        "ad_health_check_mcp_server",
+        "ad_get_mcp_schema_tools_info",
+    )
+
+    # Attributes swapped per request in multi-AD mode.
+    _TENANT_ATTRS = (
+        "config", "ldap_manager", "user_tools", "group_tools",
+        "computer_tools", "ou_tools", "security_tools", "security_manager",
+    )
+
     def __init__(
         self,
         config_path: Optional[str] = None,
         host: str = "0.0.0.0",
         port: int = 8820,
+        servers_path: Optional[str] = None,
+        mode: Optional[str] = None,
     ):
         self.config_path = config_path
         self.host = host
         self.port = port
 
+        # Mode gate. 'single' keeps the original one-AD-per-process path.
+        self.mode = (mode or os.getenv("AD_MCP_MODE") or "single").strip().lower()
+        if self.mode not in ("single", "multi"):
+            raise ValueError(
+                f"AD_MCP_MODE invalido: {self.mode!r}. Use 'single' ou 'multi'."
+            )
+        self.multi = self.mode == "multi"
+        self.pool = None
+        self.servers_path = None
+        self._bound_server = None
+        self._bind_lock = asyncio.Lock()
+
+        if self.multi:
+            self._init_multi(servers_path)
+        else:
+            self._init_single()
+
+        # Build tool registry
+        self._build_tool_registry()
+
+        # Create FastAPI app
+        self.app = self._create_app()
+
+    def _init_single(self):
+        """Single-AD mode: one directory per process (unchanged behaviour)."""
         # Load configuration
-        self.config = load_config(config_path)
+        self.config = load_config(self.config_path)
         validate_config(self.config)
 
         # Setup logging
@@ -146,7 +191,8 @@ class ActiveDirectoryMCPFastAPI:
         self.ldap_manager = LDAPManager(
             self.config.active_directory,
             self.config.security,
-            self.config.performance
+            self.config.performance,
+            ou_config=self.config.organizational_units,
         )
 
         # Test connection
@@ -159,11 +205,52 @@ class ActiveDirectoryMCPFastAPI:
         self.ou_tools = OrganizationalUnitTools(self.ldap_manager)
         self.security_tools = SecurityTools(self.ldap_manager)
 
-        # Build tool registry
-        self._build_tool_registry()
+    def _init_multi(self, servers_path: Optional[str] = None):
+        """Multi-AD mode: N directories served by one process.
 
-        # Create FastAPI app
-        self.app = self._create_app()
+        No LDAP connection is opened here. A directory is only contacted when a
+        tool actually targets it, so a misconfigured or unreachable server
+        cannot stop the process from starting.
+        """
+        self.servers_path = servers_path or os.getenv("AD_MCP_SERVERS")
+        entries = load_multi_config(self.servers_path)
+
+        logging_config = LoggingConfig(
+            level=os.getenv("AD_MCP_LOG_LEVEL", "INFO"),
+            file=os.getenv("AD_MCP_LOG_FILE") or None,
+        )
+        self.logger = setup_logging(logging_config)
+
+        self.pool = ADServerPool(entries)
+
+        # @MX:ANCHOR Unbound tenant state is None on purpose: any handler that
+        # runs outside _bound() must crash loudly instead of silently reusing
+        # whichever directory happened to be bound last.
+        for name in self._TENANT_ATTRS:
+            setattr(self, name, None)
+
+        invalid = {k: e.error for k, e in entries.items() if not e.valid}
+        self.logger.info(
+            "Modo multi-AD: %d servidores configurados (%d validos) a partir de %s",
+            len(entries), len(entries) - len(invalid), self.servers_path,
+        )
+        for key, error in invalid.items():
+            self.logger.error("Servidor '%s' NAO utilizavel: %s", key, error)
+
+    @contextmanager
+    def _bound(self, bundle):
+        """Bind one directory's managers to self for the duration of a call."""
+        saved = {name: getattr(self, name, None) for name in self._TENANT_ATTRS}
+        previous_server = self._bound_server
+        for name in self._TENANT_ATTRS:
+            setattr(self, name, getattr(bundle, name))
+        self._bound_server = bundle.key
+        try:
+            yield bundle
+        finally:
+            for name, value in saved.items():
+                setattr(self, name, value)
+            self._bound_server = previous_server
 
     def _init_client_security(self):
         """Initialize client security manager."""
@@ -781,6 +868,150 @@ class ActiveDirectoryMCPFastAPI:
             "handler": self._handle_get_schema_info
         }
 
+        # ---------------------------------------------------------------
+        # Multi-AD layer (no-op in single mode)
+        # ---------------------------------------------------------------
+        for name in self._GLOBAL_TOOLS:
+            if name in self.tools:
+                self.tools[name]["global"] = True
+
+        if self.multi:
+            self._register_multi_ad_tools()
+            self._inject_ad_server_parameter()
+
+    # ============= MULTI-AD LAYER =============
+
+    _AD_SERVER_PARAM = {
+        "type": "string",
+        "description": (
+            "Servidor de Active Directory alvo. OBRIGATORIO nesta tool de escrita: "
+            "uma alteracao precisa nomear um unico diretorio, e 'todos' nao e aceito. "
+            "Use ad_list_ad_servers para os nomes."
+        ),
+    }
+
+    _AD_SERVER_PARAM_LEITURA = {
+        "type": "string",
+        "description": (
+            "Servidor de Active Directory a consultar. Opcional: se omitido, ou com "
+            "'todos'/'all', a busca roda em TODOS os ADs configurados e a resposta diz "
+            "em qual cada resultado foi encontrado. Use isso quando nao souber onde a "
+            "pessoa ou o objeto esta. Use ad_list_ad_servers para os nomes."
+        ),
+    }
+
+    def _register_multi_ad_tools(self) -> None:
+        """Swap the client-shaped catalogue tools for server-shaped ones.
+
+        In multi-AD mode the axis is the SERVER, not "the client": a name with
+        "client" in it invites the model to pass a customer name where a routing
+        key is expected. The two legacy tools are also redundant here -- three
+        tools answering "which directories exist?" is three chances to pick the
+        wrong one -- so multi mode registers exactly two.
+        """
+        self.tools.pop("ad_list_configured_clients", None)
+        self.tools.pop("ad_check_client_configuration", None)
+
+        self.tools["ad_check_ad_server_configured"] = {
+            "description": (
+                "Verificacao de servidor de Active Directory nesta instancia \u2014 confirma se "
+                "um nome, apelido, dominio ou nome de cliente corresponde a um AD configurado "
+                "aqui e devolve o valor exato para o parametro ad_server. Use quando o usuario "
+                "citar o cliente pelo nome e voce precisar do ad_server correspondente, ou para "
+                "responder se determinado cliente tem AD nesta instancia. Retorna se existe, o "
+                "ad_server a usar, nome e dominio; quando nao existe, retorna a lista dos que "
+                "existem. Consulta somente leitura."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "server_name": {
+                        "type": "string",
+                        "description": "Nome, apelido, dominio ou nome do cliente a verificar",
+                    }
+                },
+                "required": ["server_name"],
+            },
+            "handler": self._handle_check_client_exists,
+            "global": True,
+        }
+
+        self.tools["ad_list_ad_servers"] = {
+            "description": (
+                "Servidores de Active Directory disponiveis nesta instancia \u2014 lista os ADs "
+                "configurados com o nome exato a usar no parametro ad_server, dominio, host "
+                "LDAP, base DN, unidades organizacionais e estado da conexao. Use quando nao "
+                "souber qual valor passar em ad_server, quando o usuario citar um cliente sem "
+                "dizer o servidor, ou para confirmar se um cliente tem AD configurado aqui. "
+                "Retorna nome, apelidos, dominio, servidor LDAP, base DN, OUs e status por "
+                "servidor. Credenciais de bind nao sao expostas. Consulta somente leitura."
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
+            "handler": self._handle_list_ad_servers,
+            "global": True,
+        }
+
+    # Values that mean "every configured directory".
+    _TODOS = {"all", "todos", "todas", "*", "any", "qualquer", "geral", "tudo"}
+
+    def _is_write_tool(self, tool: dict) -> bool:
+        """A tool is a write when its own schema asks for a confirmation.
+
+        @MX:ANCHOR Derived from the schema, never from a hand-kept list: a new
+        write tool is covered the moment it declares client_confirmation.
+        """
+        props = (tool.get("inputSchema") or {}).get("properties") or {}
+        return "client_confirmation" in props or "automation_token" in props
+
+    def _inject_ad_server_parameter(self) -> None:
+        """Add the required ad_server parameter to every directory-bound tool.
+
+        @MX:ANCHOR The schema is the only place the requirement is declared;
+        handle_tools_call is the only place it is enforced. Both must agree on
+        the same set (everything not marked "global").
+        """
+        for name, tool in self.tools.items():
+            if tool.get("global"):
+                continue
+            escrita = self._is_write_tool(tool)
+            tool["write"] = escrita
+
+            schema = dict(tool.get("inputSchema") or {"type": "object"})
+            properties = dict(schema.get("properties") or {})
+            param = dict(self._AD_SERVER_PARAM if escrita else self._AD_SERVER_PARAM_LEITURA)
+            # ad_server first: the model reads the routing key before the payload.
+            merged = {"ad_server": param}
+            merged.update(properties)
+            schema["properties"] = merged
+
+            required = list(schema.get("required") or [])
+            if escrita:
+                # A write must name exactly one directory. There is no "all".
+                if "ad_server" not in required:
+                    required.insert(0, "ad_server")
+            else:
+                # Reads may omit it: absent means every configured directory.
+                required = [r for r in required if r != "ad_server"]
+            schema["required"] = required
+            tool["inputSchema"] = schema
+
+    def _handle_list_ad_servers(self, params: dict) -> dict:
+        if not self.multi or self.pool is None:
+            return {
+                "modo": "single",
+                "total": 1,
+                "mensagem": (
+                    "Esta instancia atende um unico Active Directory, entao nao existe "
+                    "parametro ad_server. Nao informe ad_server nas demais tools."
+                ),
+                "servidor": {
+                    "dominio": self.config.active_directory.domain,
+                    "servidor_ldap": self.config.active_directory.server,
+                    "base_dn": self.config.active_directory.base_dn,
+                },
+            }
+        return self.pool.list_servers()
+
     # ============= TOOL HANDLERS =============
 
     def _format_result(self, result) -> dict:
@@ -798,7 +1029,10 @@ class ActiveDirectoryMCPFastAPI:
 
     def _handle_get_client_info(self, params: dict) -> dict:
         if self.security_manager:
-            return self.security_manager.get_client_info()
+            info = self.security_manager.get_client_info()
+            if self.multi and self._bound_server:
+                info["ad_server"] = self._bound_server
+            return info
         return {
             "client": {"name": "Unknown", "slug": "unknown"},
             "domain": {"name": self.config.active_directory.domain},
@@ -806,29 +1040,109 @@ class ActiveDirectoryMCPFastAPI:
         }
 
     def _handle_list_ad_clients(self, params: dict) -> dict:
-        try:
-            result = registry_list_clients()
-            if self.security_manager:
-                result["current_instance"] = {
-                    "name": self.security_manager.client_name,
-                    "slug": self.security_manager.client_slug,
-                    "domain": self.security_manager.domain
-                }
-            return result
-        except Exception as e:
-            return {"error": str(e)}
+        if self.multi and self.pool is not None:
+            listing = self.pool.list_servers()
+            return {
+                "total": listing["total"],
+                "clients": [
+                    {
+                        "slug": s["ad_server"],
+                        "name": s["nome"],
+                        "domain": s["dominio"],
+                        "type": s.get("tipo", "cliente"),
+                        "status": s["status"],
+                    }
+                    for s in listing["servidores"]
+                ],
+                "message": (
+                    "Clientes com AD configurado nesta instancia multi-AD. Use o campo "
+                    "'slug' no parametro ad_server das demais tools."
+                ),
+                "detalhes": "Chame ad_list_ad_servers para dominio, host, base DN e OUs.",
+            }
+
+        # Single-AD mode: this process serves exactly one client, and saying
+        # so is the whole truth available here. (There used to be a central
+        # registry file; it pointed at a path that never existed and listed
+        # ports that were never used, so it always answered "no clients".)
+        if not self.security_manager:
+            return {
+                "total": 0,
+                "clients": [],
+                "message": "Identificacao de cliente indisponivel nesta instancia.",
+            }
+        return {
+            "total": 1,
+            "clients": [{
+                "slug": self.security_manager.client_slug,
+                "name": self.security_manager.client_name,
+                "domain": self.security_manager.domain,
+                "type": self.security_manager.client_type,
+            }],
+            "current_instance": {
+                "name": self.security_manager.client_name,
+                "slug": self.security_manager.client_slug,
+                "domain": self.security_manager.domain,
+            },
+            "message": (
+                f"Esta instancia atende um unico cliente: "
+                f"{self.security_manager.client_name} ({self.security_manager.domain}). "
+                "Outros clientes podem existir em outras instancias e nao aparecem aqui."
+            ),
+        }
 
     def _handle_check_client_exists(self, params: dict) -> dict:
-        client_name = params.get("client_name", "")
-        try:
-            registry = get_client_registry()
-            client = registry.get_client(client_name)
-            if client:
-                return {"exists": True, "client": client}
-            available = registry.list_client_names()
-            return {"exists": False, "searched_for": client_name, "available": available}
-        except Exception as e:
-            return {"error": str(e), "exists": False}
+        # server_name is the multi-AD name; client_name is the single-AD legacy one.
+        client_name = params.get("server_name") or params.get("client_name") or ""
+
+        if self.multi and self.pool is not None:
+            bundle, error = self.pool.resolve_or_error(client_name)
+            if error is not None:
+                return {"exists": False, "searched_for": client_name, **error}
+            return {
+                "exists": True,
+                "client": {
+                    "slug": bundle.key,
+                    "name": bundle.entry.label,
+                    "domain": bundle.entry.domain,
+                },
+                "ad_server": bundle.key,
+                "message": (
+                    f"Cliente '{bundle.entry.label}' tem AD configurado. Use "
+                    f"ad_server='{bundle.key}'."
+                ),
+            }
+
+        if not self.security_manager:
+            return {"exists": False, "searched_for": client_name,
+                    "message": "Identificacao de cliente indisponivel nesta instancia."}
+
+        normalized = str(client_name).lower().strip().replace(" ", "-")
+        known = {
+            self.security_manager.client_slug,
+            self.security_manager.client_name.lower().replace(" ", "-"),
+            self.security_manager.domain.split(".")[0].lower(),
+        }
+        if normalized in known:
+            return {
+                "exists": True,
+                "client": {
+                    "slug": self.security_manager.client_slug,
+                    "name": self.security_manager.client_name,
+                    "domain": self.security_manager.domain,
+                },
+            }
+        return {
+            "exists": False,
+            "searched_for": client_name,
+            "available": [f"{self.security_manager.client_name} "
+                          f"({self.security_manager.client_slug})"],
+            "message": (
+                f"Esta instancia atende apenas {self.security_manager.client_name}. "
+                f"Nao e possivel afirmar, daqui, se '{client_name}' tem AD em outra "
+                "instancia."
+            ),
+        }
 
     def _handle_list_users(self, params: dict) -> dict:
         result = self.user_tools.list_users(
@@ -1125,11 +1439,41 @@ class ActiveDirectoryMCPFastAPI:
             return {"success": False, "error": str(e)}
 
     def _handle_health(self, params: dict) -> dict:
+        if self.multi and self.pool is not None:
+            listing = self.pool.list_servers()
+            servers = listing["servidores"]
+            broken = [s["ad_server"] for s in servers
+                      if s["status"] in ("configuracao_invalida", "erro")]
+            health_info = {
+                "status": "degraded" if broken else "ok",
+                "server": "ActiveDirectoryMCP-FastAPI",
+                "version": "1.1.0",
+                "mode": "multi",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "transport": "streamable-http",
+                "total_servidores": listing["total"],
+                "total_habilitados": listing["total_habilitados"],
+                "servidores": [
+                    {"ad_server": s["ad_server"], "dominio": s["dominio"],
+                     "status": s["status"]}
+                    for s in servers
+                ],
+                "nota": (
+                    "Servidores com status 'nao_conectado' ainda nao foram usados nesta "
+                    "execucao. A conexao LDAP so e aberta na primeira operacao, portanto "
+                    "este health check nao afirma nada sobre a saude deles."
+                ),
+            }
+            if broken:
+                health_info["servidores_com_problema"] = broken
+            return health_info
+
         health_info = {
             "status": "ok",
             "server": "ActiveDirectoryMCP-FastAPI",
-            "version": "1.0.0",
-            "timestamp": datetime.utcnow().isoformat(),
+            "version": "1.1.0",
+            "mode": "single",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "transport": "streamable-http",
             "ldap_connection": "unknown"
         }
@@ -1153,14 +1497,24 @@ class ActiveDirectoryMCPFastAPI:
         return health_info
 
     def _handle_get_schema_info(self, params: dict) -> dict:
-        return {
+        info = {
             "server": "ActiveDirectoryMCP-FastAPI",
-            "version": "1.0.0",
+            "version": "1.1.0",
             "transport": "streamable-http",
+            "mode": self.mode,
             "multi_tenant": True,
             "total_tools": len(self.tools),
             "tools": list(self.tools.keys())
         }
+        if self.multi:
+            info["ad_server_obrigatorio_em"] = sorted(
+                name for name, tool in self.tools.items() if not tool.get("global")
+            )
+            info["tools_sem_ad_server"] = sorted(
+                name for name, tool in self.tools.items() if tool.get("global")
+            )
+            info["total_servidores"] = len(self.pool.entries) if self.pool else 0
+        return info
 
     # ============= MCP PROTOCOL HANDLERS =============
 
@@ -1189,22 +1543,394 @@ class ActiveDirectoryMCPFastAPI:
             })
         return {"tools": tools_list}
 
-    async def handle_tools_call(self, params: dict) -> dict:
-        """Handle tools/call method."""
-        tool_name = params.get("name")
-        tool_args = params.get("arguments", {})
-
-        if tool_name not in self.tools:
-            raise ValueError(f"Unknown tool: {tool_name}")
-
-        handler = self.tools[tool_name]["handler"]
-        result = handler(tool_args)
-
+    def _as_content(self, payload) -> dict:
+        """Wrap a payload in the MCP content envelope."""
         return {
             "content": [
-                {"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False)}
+                {"type": "text", "text": json.dumps(payload, indent=2, ensure_ascii=False)}
             ]
         }
+
+    # ============= ENTRADA DE MODELO FRACO =============
+    # The server owns its schema, so it can absorb the shapes a model actually
+    # sends instead of answering with a Python exception the model cannot act on.
+
+    _CAMPOS_DE_LOGIN = ("username", "computer_name", "group_name")
+    _LIMITE_DIAS = 36500  # a hundred years; beyond this datetime itself overflows
+
+    @staticmethod
+    def _extrair_login(valor: str) -> str:
+        """Reduce a DN, a UPN or DOMAIN\\user to the bare account name."""
+        texto = str(valor).strip().strip('"').strip("'")
+        if not texto:
+            return texto
+        if "=" in texto and "," in texto:          # CN=Joao Silva,CN=Users,DC=...
+            primeiro = texto.split(",")[0]
+            if "=" in primeiro:
+                return primeiro.split("=", 1)[1].strip()
+        if "\\" in texto:                          # DOMINIO\usuario
+            return texto.rsplit("\\", 1)[1].strip()
+        if "@" in texto:                            # usuario@dominio
+            return texto.split("@", 1)[0].strip()
+        return texto
+
+    @staticmethod
+    def _coagir(valor, tipos):
+        """Best-effort conversion of a value to one of the schema's types."""
+        if "array" in tipos and not isinstance(valor, list):
+            if isinstance(valor, str):
+                texto = valor.strip()
+                if texto.startswith("["):
+                    try:
+                        carregado = json.loads(texto)
+                        if isinstance(carregado, list):
+                            return [v for v in carregado if v is not None]
+                    except (ValueError, TypeError):
+                        pass
+                return [texto] if texto else []
+            if valor is not None:
+                return [valor]
+        if "array" in tipos and isinstance(valor, list):
+            return [v for v in valor if v is not None]
+        if "object" in tipos and isinstance(valor, str):
+            try:
+                carregado = json.loads(valor)
+                if isinstance(carregado, dict):
+                    return carregado
+            except (ValueError, TypeError):
+                pass
+        if "integer" in tipos and isinstance(valor, str):
+            try:
+                return int(valor.strip())
+            except ValueError:
+                pass
+        if "boolean" in tipos and isinstance(valor, str):
+            if valor.strip().lower() in ("true", "sim", "yes", "1"):
+                return True
+            if valor.strip().lower() in ("false", "nao", "no", "0"):
+                return False
+        if "string" in tipos and isinstance(valor, list) and len(valor) == 1:
+            return str(valor[0])
+        if "string" in tipos and isinstance(valor, (int, float)) and "integer" not in tipos:
+            return str(valor)
+        return valor
+
+    @staticmethod
+    def _tipos_do_schema(spec: dict) -> set:
+        tipos = set()
+        if isinstance(spec.get("type"), str):
+            tipos.add(spec["type"])
+        for alternativa in spec.get("anyOf") or []:
+            if isinstance(alternativa, dict) and isinstance(alternativa.get("type"), str):
+                tipos.add(alternativa["type"])
+        return tipos
+
+    def _sanear_argumentos(self, tool_name, tool, args):
+        """Coerce arguments to the tool's own schema.
+
+        @MX:ANCHOR Everything here is driven by inputSchema, so a tool added
+        later is covered without touching this function. Returns
+        (argumentos, recusa) -- recusa is a ready payload when the call cannot
+        proceed, and it always says what to send instead.
+        """
+        schema = tool.get("inputSchema") or {}
+        propriedades = schema.get("properties") or {}
+        saneados = {}
+
+        bruto_ad_server = args.get("ad_server")
+        if bruto_ad_server is not None and not isinstance(bruto_ad_server, (str, list)):
+            return None, {
+                "sucesso": False,
+                "erro": "AD_SERVER_INVALIDO",
+                "mensagem": (
+                    f"'ad_server' precisa ser um texto com o nome do servidor; veio "
+                    f"{type(bruto_ad_server).__name__} ({bruto_ad_server!r}). "
+                    "Use ad_list_ad_servers para ver os nomes."
+                ),
+                "tool": tool_name,
+            }
+
+        for chave, valor in args.items():
+            spec = propriedades.get(chave)
+            if spec is None:
+                # Unknown key: keep it, the handler reads by name and ignores it.
+                saneados[chave] = valor
+                continue
+            valor = self._coagir(valor, self._tipos_do_schema(spec))
+            if chave in self._CAMPOS_DE_LOGIN and isinstance(valor, str):
+                valor = self._extrair_login(valor)
+            if isinstance(valor, str) and chave != "filter_criteria":
+                valor = valor.strip()
+            saneados[chave] = valor
+
+        faltando = [c for c in (schema.get("required") or [])
+                    if c not in saneados or saneados[c] in (None, "")]
+
+        if "ad_server" in faltando and tool.get("write"):
+            # The specific message says WHY, which the generic one cannot.
+            return None, {
+                "sucesso": False,
+                "erro": "AD_SERVER_OBRIGATORIO_PARA_ESCRITA",
+                "mensagem": (
+                    f"A tool {tool_name} altera o Active Directory, entao exige um unico "
+                    "servidor em 'ad_server'. 'todos' nao e aceito para escrita, e nao "
+                    "existe servidor padrao."
+                ),
+                "servidores_disponiveis": self.pool._short_catalog() if self.pool else [],
+                "tool": tool_name,
+            }
+
+        if faltando:
+            return None, {
+                "sucesso": False,
+                "erro": "PARAMETRO_OBRIGATORIO_AUSENTE",
+                "mensagem": (
+                    f"A tool {tool_name} exige {', '.join(faltando)}, que nao veio na "
+                    "chamada. Repita informando esse(s) parametro(s)."
+                ),
+                "parametros_faltando": faltando,
+                "parametros_aceitos": sorted(propriedades),
+                "tool": tool_name,
+            }
+
+        dias = saneados.get("days")
+        if dias is not None:
+            if not isinstance(dias, int):
+                return None, {
+                    "sucesso": False, "erro": "PARAMETRO_INVALIDO", "tool": tool_name,
+                    "mensagem": f"'days' precisa ser um numero inteiro; veio {dias!r}.",
+                }
+            if dias <= 0 or dias > self._LIMITE_DIAS:
+                return None, {
+                    "sucesso": False, "erro": "PARAMETRO_INVALIDO", "tool": tool_name,
+                    "mensagem": (
+                        f"'days' precisa estar entre 1 e {self._LIMITE_DIAS}; veio {dias}. "
+                        "Um valor negativo ou fora dessa faixa nao descreve um periodo."
+                    ),
+                }
+        return saneados, None
+
+    _CAMPOS_DN = ("ou", "parent_ou", "target_parent_dn", "source_dn", "ou_dn", "target_dn")
+
+    def _validar_dn_no_dominio(self, tool_name, args, bundle):
+        """A DN from another domain is a wrong-tenant call, not a search miss.
+
+        Without this the LDAP layer answered "invalid server address", which
+        says nothing about the actual mistake.
+        """
+        base = bundle.config.active_directory.base_dn.lower().replace(" ", "")
+        for chave in self._CAMPOS_DN:
+            valor = args.get(chave)
+            if not isinstance(valor, str) or not valor.strip():
+                continue
+            alvo = valor.lower().replace(" ", "")
+            if "dc=" in alvo and not alvo.endswith(base):
+                return {
+                    "sucesso": False,
+                    "erro": "OU_FORA_DO_DOMINIO",
+                    "mensagem": (
+                        f"O DN informado em '{chave}' ({valor}) nao pertence ao servidor "
+                        f"'{bundle.key}', cujo dominio e {bundle.config.active_directory.base_dn}. "
+                        "Ou o ad_server esta errado, ou o DN e de outro cliente."
+                    ),
+                    "ad_server": bundle.key,
+                    "base_dn_do_servidor": bundle.config.active_directory.base_dn,
+                    "tool": tool_name,
+                }
+        return None
+
+    def _resolver_nome_de_tool(self, tool_name):
+        """Accept the hub-prefixed name and suggest neighbours for a typo."""
+        if tool_name in self.tools:
+            return tool_name, None
+        nome = str(tool_name or "")
+        for prefixo in ("ad-multi-", "ad_multi_", "mcp__ad-multi__", "ad-multi."):
+            if nome.startswith(prefixo) and nome[len(prefixo):] in self.tools:
+                return nome[len(prefixo):], None
+        pedaco = nome.lower().replace("-", "_")
+        parecidas = [t for t in self.tools
+                     if pedaco in t or any(p in t for p in pedaco.split("_") if len(p) > 4)]
+        return None, {
+            "sucesso": False,
+            "erro": "TOOL_DESCONHECIDA",
+            "mensagem": (
+                f"Nao existe uma tool chamada '{tool_name}' neste servidor. "
+                "Use um dos nomes exatos listados."
+            ),
+            "tools_parecidas": sorted(parecidas)[:8] or sorted(self.tools)[:8],
+        }
+
+    # Above this many characters the aggregated answer is replaced by a
+    # per-server summary instead of being silently cut.
+    _LIMITE_RESPOSTA = 120_000
+
+    @staticmethod
+    def _tem_resultado(payload) -> bool:
+        """Whether a per-server payload actually found something."""
+        if not isinstance(payload, dict):
+            return bool(payload)
+        if payload.get("success") is False or "error" in payload:
+            return False
+        for chave, valor in payload.items():
+            if isinstance(valor, list):
+                return len(valor) > 0
+            if chave.startswith(("total", "count")) and isinstance(valor, int):
+                return valor > 0
+        return True
+
+    async def _executar_em_todos(self, tool_name, handler, tool_args, pedido) -> dict:
+        """Run a read tool against every enabled directory and merge the answers.
+
+        @MX:ANCHOR A server that fails is listed, never dropped: an omitted
+        directory reads as "nothing there", which is a different -- and false --
+        statement from "could not look".
+        """
+        achados, vazios, falhas = {}, [], []
+
+        for chave in self.pool.available_names():
+            bundle, error = self.pool.resolve_or_error(chave)
+            if error is not None:
+                falhas.append({"ad_server": chave, "erro": error.get("erro"),
+                               "mensagem": error.get("mensagem")})
+                continue
+            try:
+                async with self._bind_lock:
+                    with self._bound(bundle):
+                        resultado = handler(dict(tool_args))
+            except Exception as exc:
+                falhas.append({"ad_server": chave, "erro": type(exc).__name__,
+                               "mensagem": str(exc)[:200]})
+                continue
+            if self._tem_resultado(resultado):
+                achados[chave] = resultado
+            else:
+                vazios.append(chave)
+
+        consultados = len(achados) + len(vazios) + len(falhas)
+        resposta = {
+            "modo_de_busca": "TODOS OS SERVIDORES",
+            "tool": tool_name,
+            "servidores_consultados": consultados,
+            "encontrado_em": sorted(achados),
+            "sem_resultado_em": sorted(vazios),
+            "resultados_por_servidor": achados,
+        }
+        if falhas:
+            resposta["servidores_com_falha"] = falhas
+            resposta["aviso"] = (
+                f"{len(falhas)} de {consultados} servidores nao responderam. O que eles "
+                "tem NAO foi verificado: 'sem resultado' vale apenas para "
+                f"{len(vazios) + len(achados)} servidores."
+            )
+        if not pedido:
+            resposta["nota"] = (
+                "'ad_server' nao foi informado, entao a busca rodou em todos os ADs. "
+                "Para consultar um so, informe o nome do servidor."
+            )
+        resposta["resumo"] = (
+            f"Encontrado em {len(achados)} de {consultados} servidores"
+            + (f": {', '.join(sorted(achados))}." if achados else ".")
+        )
+
+        tamanho = len(json.dumps(resposta, ensure_ascii=False, default=str))
+        if tamanho > self._LIMITE_RESPOSTA:
+            resumo_por_servidor = {}
+            for chave, payload in achados.items():
+                if isinstance(payload, dict):
+                    resumo_por_servidor[chave] = {
+                        k: (len(v) if isinstance(v, list) else v)
+                        for k, v in payload.items()
+                        if isinstance(v, (int, str, bool)) or isinstance(v, list)
+                    }
+                else:
+                    resumo_por_servidor[chave] = "resultado nao estruturado"
+            resposta["resultados_por_servidor"] = resumo_por_servidor
+            resposta["RESPOSTA_CONDENSADA"] = (
+                f"A resposta completa teria {tamanho} caracteres, acima do limite. "
+                "Cada servidor aparece apenas com suas contagens. Para ver os registros, "
+                "repita a chamada informando um 'ad_server' especifico, ou restrinja a "
+                "busca com filtros."
+            )
+        return resposta
+
+    async def handle_tools_call(self, params: dict) -> dict:
+        """Handle tools/call method.
+
+        In multi-AD mode this is the single place where a call is routed to a
+        directory. Routing lives here and nowhere else, so a tool cannot reach
+        an LDAP connection without having named its server first.
+        """
+        tool_name = params.get("name")
+        bruto = params.get("arguments")
+        if isinstance(bruto, str):
+            # Some clients send the arguments object as a JSON string.
+            try:
+                bruto = json.loads(bruto)
+            except (ValueError, TypeError):
+                bruto = {}
+        tool_args = dict(bruto or {})
+
+        resolvido, recusa = self._resolver_nome_de_tool(tool_name)
+        if recusa is not None:
+            self.logger.warning("tools/call com nome desconhecido: %r", tool_name)
+            return self._as_content(recusa)
+        tool_name = resolvido
+
+        tool = self.tools[tool_name]
+        handler = tool["handler"]
+
+        tool_args, recusa = self._sanear_argumentos(tool_name, tool, tool_args)
+        if recusa is not None:
+            self.logger.warning("tools/call recusada em %s: %s", tool_name, recusa["erro"])
+            return self._as_content(recusa)
+
+        if self.multi and not tool.get("global"):
+            requested = tool_args.pop("ad_server", None)
+            pedido = str(requested).strip().lower() if requested is not None else ""
+
+            if pedido in self._TODOS or pedido == "":
+                if tool.get("write"):
+                    # Never fan a write out, and never guess which directory it
+                    # meant: both would edit the wrong customer's AD.
+                    return self._as_content({
+                        "sucesso": False,
+                        "erro": "AD_SERVER_OBRIGATORIO_PARA_ESCRITA",
+                        "mensagem": (
+                            f"A tool {tool_name} altera o Active Directory, entao exige um "
+                            "unico servidor em 'ad_server'. 'todos' nao e aceito para "
+                            "escrita, e nao existe servidor padrao."
+                        ),
+                        "servidores_disponiveis": self.pool._short_catalog(),
+                        "tool": tool_name,
+                    })
+                self.logger.info("tools/call %s -> ad_server=TODOS", tool_name)
+                return self._as_content(
+                    await self._executar_em_todos(tool_name, handler, tool_args, pedido))
+
+            bundle, error = self.pool.resolve_or_error(requested)
+            if error is not None:
+                error["tool"] = tool_name
+                self.logger.warning(
+                    "Chamada recusada em %s: %s (ad_server=%r)",
+                    tool_name, error["erro"], requested,
+                )
+                return self._as_content(error)
+
+            # @MX:WARN The tenant is bound onto self for the duration of the
+            # handler. The lock keeps exactly one tenant bound at a time; drop it
+            # and a future async handler could observe another customer's AD.
+            recusa = self._validar_dn_no_dominio(tool_name, tool_args, bundle)
+            if recusa is not None:
+                return self._as_content(recusa)
+
+            async with self._bind_lock:
+                with self._bound(bundle):
+                    self.logger.info("tools/call %s -> ad_server=%s", tool_name, bundle.key)
+                    result = handler(tool_args)
+        else:
+            result = handler(tool_args)
+
+        return self._as_content(result)
 
     async def handle_prompts_list(self, params: dict) -> dict:
         """Handle prompts/list method."""
@@ -1224,7 +1950,15 @@ class ActiveDirectoryMCPFastAPI:
             raise ValueError(f"Prompt não encontrado: {prompt_name}")
 
         # Chamar handler de prompts com o ldap_manager
-        result = await handle_get_prompt(prompt_name, prompt_args, self.ldap_manager)
+        ldap_manager = self.ldap_manager
+        if self.multi and self.pool is not None:
+            bundle, error = self.pool.resolve_or_error(prompt_args.get("ad_server"))
+            if error is not None:
+                raise ValueError(error["mensagem"])
+            ldap_manager = bundle.ldap_manager
+            prompt_args = {k: v for k, v in prompt_args.items() if k != "ad_server"}
+
+        result = await handle_get_prompt(prompt_name, prompt_args, ldap_manager)
         return result
 
     async def handle_request(self, request_data: dict) -> dict:
@@ -1271,7 +2005,7 @@ class ActiveDirectoryMCPFastAPI:
             server.logger.info(f"Starting AD MCP on port {server.port}")
             yield
             server.logger.info("Shutting down AD MCP")
-            server.ldap_manager.disconnect()
+            server._shutdown_connections()
 
         app = FastAPI(
             title="MCP Active Directory Server",
@@ -1296,7 +2030,7 @@ class ActiveDirectoryMCPFastAPI:
             session_id = request.headers.get("mcp-session-id") or str(uuid.uuid4())
             server.logger.info(f"SSE connection opened: {session_id}")
 
-            mcp_sessions[session_id] = {"created_at": datetime.utcnow(), "active": True}
+            mcp_sessions[session_id] = {"created_at": datetime.now(timezone.utc), "active": True}
 
             async def event_generator():
                 try:
@@ -1357,6 +2091,13 @@ class ActiveDirectoryMCPFastAPI:
 
         return app
 
+    def _shutdown_connections(self) -> None:
+        """Close every LDAP connection this process opened."""
+        if self.multi and self.pool is not None:
+            self.pool.disconnect_all()
+        elif self.ldap_manager is not None:
+            self.ldap_manager.disconnect()
+
     def run(self):
         """Start the server."""
         uvicorn.run(
@@ -1374,21 +2115,36 @@ def main():
     parser = argparse.ArgumentParser(description='Active Directory MCP FastAPI Server')
     parser.add_argument('--host', default='0.0.0.0', help='Host (default: 0.0.0.0)')
     parser.add_argument('--port', type=int, default=8820, help='Port (default: 8820)')
-    parser.add_argument('--config', help='Config file path')
+    parser.add_argument('--config', help='Config file path (single-AD mode)')
+    parser.add_argument('--servers', help='Multi-AD servers file (multi-AD mode)')
+    parser.add_argument('--mode', choices=['single', 'multi'],
+                        help='single (default) or multi. Overrides AD_MCP_MODE.')
 
     args = parser.parse_args()
 
+    mode = (args.mode or os.getenv("AD_MCP_MODE") or "single").strip().lower()
     config_path = args.config or os.getenv("AD_MCP_CONFIG")
+    servers_path = args.servers or os.getenv("AD_MCP_SERVERS")
 
-    if not config_path:
+    if mode == "multi":
+        if not servers_path:
+            print("Error: modo multi exige AD_MCP_SERVERS (ou --servers)")
+            sys.exit(1)
+    elif not config_path:
         print("Error: AD_MCP_CONFIG not set")
         sys.exit(1)
 
-    server = ActiveDirectoryMCPFastAPI(
-        config_path=config_path,
-        host=args.host,
-        port=args.port
-    )
+    try:
+        server = ActiveDirectoryMCPFastAPI(
+            config_path=config_path,
+            host=args.host,
+            port=args.port,
+            servers_path=servers_path,
+            mode=mode,
+        )
+    except MultiConfigError as exc:
+        print(f"Error: configuracao multi-AD invalida: {exc}")
+        sys.exit(1)
 
     server.run()
 

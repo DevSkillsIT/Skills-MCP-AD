@@ -15,7 +15,7 @@
   <img src="https://img.shields.io/badge/MCP-2024--11--05-blue?style=flat-square" alt="MCP Version"/>
   <img src="https://img.shields.io/badge/Python-3.11+-blue?style=flat-square&logo=python" alt="Python"/>
   <img src="https://img.shields.io/badge/Transport-stdio_|_HTTP-orange?style=flat-square" alt="Transport"/>
-  <img src="https://img.shields.io/badge/Tools-47-brightgreen?style=flat-square" alt="Tools"/>
+  <img src="https://img.shields.io/badge/Tools-45-brightgreen?style=flat-square" alt="Tools"/>
 </p>
 
 <p align="center">
@@ -35,9 +35,9 @@
 
 ### Key features
 
-- **47 tools** covering users, groups, computers, OUs, security, audit, and 15 MSP prompt playbooks.
-- **Three transports**: stdio (`server.py`), Streamable HTTP via FastMCP (`server_http.py`), and Streamable HTTP via FastAPI (`server_fastapi.py`).
-- **Multi-tenant by design**: each instance binds to its own AD via `AD_MCP_CONFIG`; the same codebase can serve unlimited tenants from one host.
+- **45 tools** covering users, groups, computers, OUs, security, and audit, plus 15 MSP prompt playbooks served through the MCP prompts protocol.
+- **Two transports**: stdio (`server.py`) for direct CLI/desktop clients, and Streamable HTTP via FastAPI (`server_fastapi.py`) for everything else. An earlier FastMCP-based HTTP transport (`server_http.py`) has been removed.
+- **Two deployment modes**: `single` (default) binds one process to one AD via `AD_MCP_CONFIG` — run one process per tenant to serve several; `multi` binds one process to N ADs via `AD_MCP_SERVERS`, adding a required/optional `ad_server` parameter to every directory-bound tool. See [Multi-tenant architecture](#multi-tenant-architecture).
 - **Write-operation guard rails**: every mutating tool requires either a per-tenant client confirmation string or an automation Bearer token before touching AD.
 - **Audit log on every operation**: each call records operation name, target, mode (CONFIRMED / AUTOMATION / NO_CONFIRMATION_REQUIRED), and outcome.
 
@@ -49,7 +49,9 @@ All MCP tool names use the `ad_*` prefix with a descriptive suffix &mdash; e.g. 
 
 ## Multi-tenant architecture
 
-This MCP is designed to run as one process per tenant, all sharing the same code:
+There are two ways to serve more than one AD with this codebase. Both read the same `active_directory` / `organizational_units` / `security` / `client` schema (see [Configuration](#configuration)); pick one per deployment, not both.
+
+### Mode 1 &mdash; one process per tenant (`AD_MCP_MODE=single`, the default)
 
 ```
 .base-code/                    <- this repository (shared source of truth)
@@ -66,7 +68,25 @@ This MCP is designed to run as one process per tenant, all sharing the same code
     start.sh
 ```
 
-Each `start.sh` exports `AD_MCP_CONFIG` pointing at that tenant's config and runs `python -m active_directory_mcp.server_http` on a dedicated port. Update the shared `.base-code/` once, restart all tenants &mdash; same code, isolated state.
+Each `start.sh` exports `AD_MCP_CONFIG` pointing at that tenant's config and runs `python -m active_directory_mcp.server_fastapi` on a dedicated port. Update the shared `.base-code/` once, restart every tenant process &mdash; same code, isolated state. Tools take no `ad_server` parameter in this mode; this is the original, unchanged behavior.
+
+### Mode 2 &mdash; one process serving several ADs (`AD_MCP_MODE=multi`)
+
+A single `server_fastapi.py` process can instead serve N directories, selected via `AD_MCP_SERVERS` pointing at an `ad-servers.json` (schema: [`ad-config/ad-servers.example.json`](ad-config/ad-servers.example.json) &mdash; each entry is an `ad-config.json` block plus `label`/`aliases`/`enabled`). Every directory-bound tool then gains an `ad_server` parameter:
+
+- **Write tools**: `ad_server` is required and must name exactly one directory &mdash; there is no "all".
+- **Read tools**: `ad_server` is optional; omitted (or `all`/`todos`/`*`) runs the query against every configured directory and the response reports where each result was found.
+- **Catalog tools**: `ad_list_configured_clients` and `ad_check_client_configuration` are replaced by `ad_list_ad_servers` and `ad_check_ad_server_configured`, which resolve a name, alias, domain or client name to the exact value to pass as `ad_server`. `ad_get_client_tenant_info` still exists but, like every other directory-bound tool, now takes `ad_server` (optional) instead of describing "the" tenant.
+
+`ad_server` matching ignores case, accents and surrounding whitespace; a name that matches more than one directory is refused with the list of candidates rather than guessed. Write confirmation (`client_confirmation`, below) is validated against the same directory named by `ad_server`.
+
+```bash
+export AD_MCP_MODE=multi
+export AD_MCP_SERVERS=/etc/ad-mcp/ad-servers.json
+python -m active_directory_mcp.server_fastapi --host 0.0.0.0 --port 8820
+```
+
+The stdio transport (`server.py`) only supports single mode.
 
 ---
 
@@ -111,13 +131,16 @@ export AD_MCP_CONFIG=/etc/ad-mcp/ad-config.json
 python -m active_directory_mcp.server
 
 # HTTP transport (for Claude Code, Gemini CLI, n8n, etc.):
-python -m active_directory_mcp.server_http --host 0.0.0.0 --port 8813 --path /activedirectory-mcp
+python -m active_directory_mcp.server_fastapi --host 0.0.0.0 --port 8820
+# MCP endpoint: http://localhost:8820/mcp   Health (no auth): http://localhost:8820/health
 ```
+
+Set `AD_MCP_API_TOKEN` in the environment to require a Bearer token on the HTTP transport; without it the server accepts unauthenticated requests (development only &mdash; always set it in production). See [HTTP_MCP_GUIDE.md](HTTP_MCP_GUIDE.md) for the full transport reference, including the `multi` mode.
 
 ### 4. Connect from Claude Code
 
 ```bash
-claude mcp add --transport http ad http://localhost:8813/activedirectory-mcp \
+claude mcp add --transport http ad http://localhost:8820/mcp \
   --headers "Authorization: Bearer YOUR_AUTOMATION_TOKEN"
 ```
 
@@ -129,7 +152,7 @@ claude mcp add --transport http ad http://localhost:8813/activedirectory-mcp \
 {
   "mcpServers": {
     "ad": {
-      "httpUrl": "http://localhost:8813/activedirectory-mcp",
+      "httpUrl": "http://localhost:8820/mcp",
       "headers": { "Authorization": "Bearer YOUR_AUTOMATION_TOKEN" },
       "timeout": 30000
     }
@@ -141,15 +164,15 @@ claude mcp add --transport http ad http://localhost:8813/activedirectory-mcp \
 
 ## Tools
 
-All tools use the `ad_*` prefix. Tools marked as **Write** require a confirmation string OR an automation Bearer token.
+All tools use the `ad_*` prefix. Tools marked as **Write** require a confirmation string OR an automation Bearer token. The tables below describe `single` mode (the default, 45 tools). In `multi` mode every tool listed here also gets an `ad_server` parameter, and `ad_list_configured_clients` / `ad_check_client_configuration` below are replaced by `ad_list_ad_servers` / `ad_check_ad_server_configured` &mdash; see [Multi-tenant architecture](#multi-tenant-architecture).
 
 ### Tenant identification (3)
 
 | Tool | Operation |
 |---|---|
 | `ad_get_client_tenant_info` | Return tenant info for this instance (call first) |
-| `ad_list_configured_clients` | List all clients registered in the client registry |
-| `ad_check_client_configuration` | Check if a given client slug has an AD configured |
+| `ad_list_configured_clients` | List all clients registered in the client registry (`single` mode only) |
+| `ad_check_client_configuration` | Check if a given client slug has an AD configured (`single` mode only) |
 
 ### User management (9)
 
@@ -178,7 +201,7 @@ All tools use the `ad_*` prefix. Tools marked as **Write** require a confirmatio
 | `ad_add_member_to_group` | yes | Add member |
 | `ad_remove_member_from_group` | yes | Remove member |
 
-### Computer management (8)
+### Computer management (9)
 
 | Tool | Write | Operation |
 |---|---|---|
@@ -215,16 +238,11 @@ All tools use the `ad_*` prefix. Tools marked as **Write** require a confirmatio
 | `ad_get_password_policy_violations` | Accounts violating the password policy |
 | `ad_audit_administrative_accounts` | Audit privileged account hygiene |
 
-### MSP prompts (2 tools + 15 prompts)
+### MSP prompts (15)
 
-| Tool | Operation |
-|---|---|
-| `ad_list_msp_prompts` | List the 15 professional MSP playbooks (manager & analyst) |
-| `ad_execute_msp_prompt` | Execute a named playbook with arguments |
+The 15 professional MSP playbooks (7 manager + 8 analyst) are **not tools** &mdash; they are served through the standard MCP prompts protocol, `prompts/list` and `prompts/get`, over the FastAPI HTTP transport only (the stdio transport does not expose them). See [PROMPTS.md](PROMPTS.md) for the full catalog and usage.
 
-See [PROMPTS.md](PROMPTS.md) for the full prompt catalog (security audit, onboarding, offboarding, password reset playbook, etc.).
-
-### System (4)
+### System (3)
 
 | Tool | Operation |
 |---|---|
@@ -298,7 +316,7 @@ All operations write a structured log line including: timestamp, tool name, targ
 pytest tests/ -v
 
 # Coverage
-pytest --cov=src --cov-report=term-missing
+pytest --cov=src/active_directory_mcp --cov-report=term-missing
 
 # Lint
 ruff check .

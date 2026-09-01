@@ -1,0 +1,10 @@
+{
+  "_comment": "Modo single (um AD por processo). As tools NAO recebem ad_server neste modo.",
+  "mcpServers": {
+    "ad-cliente-exemplo": {
+      "type": "http",
+      "url": "http://127.0.0.1:8850/mcp",
+      "headersHelper": "/caminho/para/mcp-headers-from-env.sh /caminho/para/o/.env AD_MCP_API_TOKEN"
+    }
+  }
+}

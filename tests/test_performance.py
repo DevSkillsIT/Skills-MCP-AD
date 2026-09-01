@@ -1,12 +1,13 @@
 """Performance and load tests for Active Directory MCP server."""
 
 import pytest
+import gc
 import json
 import os
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 from datetime import datetime, timedelta
 
 from active_directory_mcp.server import ActiveDirectoryMCPServer
@@ -43,7 +44,8 @@ def mock_server_with_performance_config(performance_config):
     """Mock server configured for performance testing."""
     with patch('active_directory_mcp.core.ldap_manager.LDAPManager.test_connection') as mock_test_conn, \
          patch('active_directory_mcp.core.ldap_manager.LDAPManager.connect') as mock_connect, \
-         patch('active_directory_mcp.config.loader.load_config') as mock_load_config:
+         patch('active_directory_mcp.server.load_config') as mock_load_config, \
+         patch('active_directory_mcp.server.validate_config'):
         
         # Return mock config object with proper structure
         from active_directory_mcp.config.models import Config, ActiveDirectoryConfig, OrganizationalUnitsConfig, SecurityConfig, LoggingConfig, PerformanceConfig
@@ -60,9 +62,11 @@ def mock_server_with_performance_config(performance_config):
         mock_test_conn.return_value = {'connected': True}
         mock_connect.return_value = Mock()
         
-        # Create server with mocked config (no file lookup needed)
-        with patch.dict(os.environ, {'AD_MCP_CONFIG': 'test_config.json'}):
-            server = ActiveDirectoryMCPServer(config_path=None)
+        # load_config is patched in the server's own namespace, which is where
+        # the name was bound by "from .config.loader import load_config".
+        # Patching config.loader instead left the real loader in place and the
+        # fixture died looking for a test_config.json that never existed.
+        server = ActiveDirectoryMCPServer(config_path='ignorado-pelo-mock.json')
         yield server
 
 
@@ -208,7 +212,7 @@ class TestLargeDatasetPerformance:
                 'dn': 'CN=Domain Admins,CN=Users,DC=perf-test,DC=local',
                 'attributes': {
                     'sAMAccountName': ['Domain Admins'],
-                    'member': [acc['dn'] for acc in admin_accounts[:50]],
+                    'member': [acc['dn'] for acc in admin_accounts],
                     'adminCount': [1]
                 }
             },
@@ -222,13 +226,25 @@ class TestLargeDatasetPerformance:
             }
         ]
         
+        # audit_admin_accounts looks each privileged group up BY NAME and then
+        # reads every member with a BASE search on the member's own DN. The old
+        # mock had no branch for that second search, so every member came back
+        # empty and the audit reported zero accounts.
+        por_dn = {acc['dn']: acc for acc in admin_accounts}
+
         def security_search_side_effect(*args, **kwargs):
             search_filter = kwargs.get('search_filter', '')
-            
-            if 'adminCount=1' in search_filter and 'objectClass=user' in search_filter:
+            search_base = kwargs.get('search_base', '')
+
+            if search_filter == '(objectClass=user)' and search_base in por_dn:
+                return [por_dn[search_base]]
+            elif 'adminCount=1' in search_filter and 'objectClass=user' in search_filter:
                 return admin_accounts
             elif 'objectClass=group' in search_filter:
-                return privileged_groups
+                # Only Domain Admins is populated, so the expected total is exact.
+                if 'sAMAccountName=Domain Admins' in search_filter:
+                    return privileged_groups[:1]
+                return []
             elif 'objectClass=domain' in search_filter:
                 return [{
                     'dn': 'DC=perf-test,DC=local',
@@ -440,14 +456,31 @@ class TestMemoryAndResourceUsage:
         dataset_sizes = [1000, 5000, 10000, 25000]
         results = []
         
+        # One sample per size is dominated by GC and scheduler noise: this test
+        # passed alone and failed inside the full suite for that reason alone.
+        # The minimum of a few runs is the least contaminated estimate of the
+        # work the code actually does.
+        REPETICOES = 3
+
         for size in dataset_sizes:
             mock_search.return_value = generate_large_dataset(size)
-            
-            start_time = time.time()
-            result = server.user_tools.list_users()
-            end_time = time.time()
-            
-            execution_time = end_time - start_time
+
+            tempos = []
+            for _ in range(REPETICOES):
+                # Collect before, and stay collected during: run inside the full
+                # suite the heap is fragmented by hundreds of earlier tests, and
+                # a collection landing on the biggest dataset (and not on the
+                # smaller one) breaks the ratio. That measures the garbage
+                # collector, not list_users.
+                gc.collect()
+                gc.disable()
+                try:
+                    start_time = time.perf_counter()
+                    result = server.user_tools.list_users()
+                    tempos.append(time.perf_counter() - start_time)
+                finally:
+                    gc.enable()
+            execution_time = min(tempos)
             
             # Verify result
             assert len(result) == 1
@@ -461,60 +494,83 @@ class TestMemoryAndResourceUsage:
             
             print(f"✅ Processed {size:,} users in {execution_time:.3f}s")
         
-        # Verify performance scales reasonably (not exponentially)
-        # Performance should be roughly linear with dataset size
-        for i in range(1, len(results)):
-            prev_result = results[i-1]
-            curr_result = results[i]
-            
-            size_ratio = curr_result['dataset_size'] / prev_result['dataset_size']
-            time_ratio = curr_result['execution_time'] / prev_result['execution_time']
-            
-            # Time ratio should not exceed size ratio by too much (allow some overhead)
-            assert time_ratio <= size_ratio * 1.5, f"Performance degraded significantly: {time_ratio:.2f}x time for {size_ratio:.2f}x data"
-        
+        # Cost PER ITEM, smallest dataset against largest.
+        #
+        # Comparing consecutive ratios amplified noise: each step inherited the
+        # jitter of the step before, and one slow sample on the biggest dataset
+        # failed the test while the code was unchanged. Measured here the per
+        # item cost is flat (about 16us at 1k and at 25k), so the assertion
+        # below has room to absorb a hiccup and still catch what it is for --
+        # a quadratic path would show a 25x rise across this range, not 3x.
+        menor, maior = results[0], results[-1]
+        custo_menor = menor['execution_time'] / menor['dataset_size']
+        custo_maior = maior['execution_time'] / maior['dataset_size']
+        crescimento = custo_maior / custo_menor
+
+        print(f"    custo por usuario: {custo_menor*1e6:.1f}us em "
+              f"{menor['dataset_size']:,} -> {custo_maior*1e6:.1f}us em "
+              f"{maior['dataset_size']:,} (x{crescimento:.2f})")
+
+        assert crescimento <= 3.0, (
+            f"custo por item subiu {crescimento:.1f}x de {menor['dataset_size']} "
+            f"para {maior['dataset_size']} usuarios: o processamento nao esta "
+            "escalando linearmente"
+        )
+
         print(f"✅ Memory/performance scaling test passed for datasets up to {max(dataset_sizes):,} users")
     
-    @patch('active_directory_mcp.core.ldap_manager.LDAPManager.connect')
-    @patch('active_directory_mcp.core.ldap_manager.LDAPManager.disconnect')
-    def test_connection_pooling_behavior(self, mock_disconnect, mock_connect, 
-                                       mock_server_with_performance_config):
-        """Test connection pooling and resource cleanup."""
-        server = mock_server_with_performance_config
-        
-        # Mock connection management
-        connection_count = 0
-        disconnect_count = 0
-        
-        def mock_connect_side_effect():
-            nonlocal connection_count
-            connection_count += 1
-            return Mock()
-        
-        def mock_disconnect_side_effect():
-            nonlocal disconnect_count
-            disconnect_count += 1
-        
-        mock_connect.side_effect = mock_connect_side_effect
-        mock_disconnect.side_effect = mock_disconnect_side_effect
-        
-        # Simulate multiple operations that would require connections
+    def test_connection_pooling_behavior(self, performance_config):
+        """N operations must reuse one LDAP connection, not open N.
+
+        The previous version mocked LDAPManager.connect AND user_tools.get_user,
+        so nothing ever opened a connection: "connection_count < num_operations"
+        passed with zero connections, proving nothing. This patches ldap3's
+        Connection instead and counts how many are actually built, which is the
+        property the LDAPManager really has -- one connection guarded by a lock,
+        reused while it stays bound.
+        """
+        # Deliberately NOT using mock_server_with_performance_config: that
+        # fixture keeps LDAPManager.connect patched for the whole test, so no
+        # ldap3 Connection would ever be built and the count would be zero.
+        from active_directory_mcp.config.models import (
+            ActiveDirectoryConfig, PerformanceConfig, SecurityConfig)
+        from active_directory_mcp.core.ldap_manager import LDAPManager
+        from active_directory_mcp.tools.user import UserTools
+
+        ldap_manager = LDAPManager(
+            ActiveDirectoryConfig(**performance_config["active_directory"]),
+            SecurityConfig(enable_tls=False),
+            PerformanceConfig(**performance_config["performance"]),
+        )
+        user_tools = UserTools(ldap_manager)
+
         num_operations = 100
-        
-        with patch.object(server.user_tools, 'get_user') as mock_get_user:
-            mock_get_user.return_value = [Mock(text='{"dn": "CN=Test,DC=test,DC=local"}')]
-            
-            # Perform operations sequentially
-            for i in range(num_operations):
-                server.user_tools.get_user(f'user{i}')
-        
-        # With connection pooling, we shouldn't create 100 connections
-        # The exact number depends on the pooling implementation
-        print(f"✅ {num_operations} operations used {connection_count} connections")
-        
-        # Verify reasonable connection reuse
-        assert connection_count < num_operations, "Connection pooling should reduce connection count"
-        assert connection_count >= 1, "At least one connection should be made"
+        conexoes_criadas = 0
+
+        def fake_connection(*args, **kwargs):
+            nonlocal conexoes_criadas
+            conexoes_criadas += 1
+            conn = MagicMock()
+            conn.bound = True
+            conn.search.return_value = True
+            conn.entries = []
+            conn.result = {}
+            return conn
+
+        try:
+            with patch('active_directory_mcp.core.ldap_manager.Connection',
+                       side_effect=fake_connection):
+                for i in range(num_operations):
+                    user_tools.get_user(f'user{i}')
+        finally:
+            ldap_manager._stop_keepalive()
+
+        print(f"OK {num_operations} operacoes usaram {conexoes_criadas} conexao(oes)")
+
+        assert conexoes_criadas == 1, (
+            f"{num_operations} operacoes deveriam reusar 1 conexao, "
+            f"mas criaram {conexoes_criadas}"
+        )
 
 
 class TestStressScenarios:

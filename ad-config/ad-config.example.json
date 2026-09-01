@@ -1,50 +1,50 @@
 {
-    "active_directory": {
-        "server": "ldaps://dc.example.com:636",
-        "server_pool": [
-            "ldaps://dc1.example.com:636",
-            "ldaps://dc2.example.com:636"
-        ],
-        "use_ssl": true,
-        "ssl_port": 636,
-        "domain": "example.com",
-        "base_dn": "DC=example,DC=com",
-        "bind_dn": "CN=ad-mcp-service,OU=Service Accounts,DC=example,DC=com",
-        "password": "REPLACE_WITH_REAL_PASSWORD",
-        "timeout": 30,
-        "auto_bind": true,
-        "receive_timeout": 10
-    },
-    "organizational_units": {
-        "users_ou": "OU=Users,DC=example,DC=com",
-        "groups_ou": "OU=Groups,DC=example,DC=com",
-        "computers_ou": "OU=Computers,DC=example,DC=com",
-        "service_accounts_ou": "OU=Service Accounts,DC=example,DC=com"
-    },
-    "security": {
-        "enable_tls": true,
-        "validate_certificate": true,
-        "ca_cert_file": "/path/to/ca-certificate.pem",
-        "check_names": true,
-        "require_secure_connection": true
-    },
-    "logging": {
-        "level": "INFO",
-        "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        "file": "/var/log/active-directory-mcp.log"
-    },
-    "performance": {
-        "connection_pool_size": 10,
-        "max_retries": 3,
-        "retry_delay": 1.0,
-        "page_size": 1000
-    },
-    "client": {
-        "name": "Example Client",
-        "slug": "example-client",
-        "type": "internal"
-    },
-    "automation": {
-        "token": "REPLACE_WITH_RANDOM_TOKEN_FOR_UNATTENDED_WRITES"
-    }
+  "_comment": "Template do modo SINGLE (AD_MCP_MODE=single, o padrao): um AD por processo, apontado por AD_MCP_CONFIG. Para varios ADs num processo so, use ad-servers.example.json. bind_dn aceita DN completo, UPN (svc@dominio) ou DOMINIO\\\\usuario -- alguns DCs so autenticam no formato NETBIOS.",
+  "active_directory": {
+    "server": "ldaps://dc.example.com:636",
+    "server_pool": [
+      "ldaps://dc1.example.com:636",
+      "ldaps://dc2.example.com:636"
+    ],
+    "use_ssl": true,
+    "ssl_port": 636,
+    "domain": "example.com",
+    "base_dn": "DC=example,DC=com",
+    "bind_dn": "CN=ad-mcp-service,OU=Service Accounts,DC=example,DC=com",
+    "password": "REPLACE_WITH_REAL_PASSWORD",
+    "timeout": 30,
+    "auto_bind": true,
+    "receive_timeout": 10
+  },
+  "organizational_units": {
+    "users_ou": "OU=Users,DC=example,DC=com",
+    "groups_ou": "OU=Groups,DC=example,DC=com",
+    "computers_ou": "OU=Computers,DC=example,DC=com",
+    "service_accounts_ou": "OU=Service Accounts,DC=example,DC=com"
+  },
+  "security": {
+    "enable_tls": true,
+    "validate_certificate": true,
+    "ca_cert_file": "/path/to/ca-certificate.pem",
+    "require_secure_connection": true
+  },
+  "logging": {
+    "level": "INFO",
+    "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    "file": "/var/log/active-directory-mcp.log"
+  },
+  "performance": {
+    "connection_pool_size": 10,
+    "max_retries": 3,
+    "retry_delay": 1.0,
+    "page_size": 1000
+  },
+  "client": {
+    "name": "Example Client",
+    "slug": "example-client",
+    "type": "internal"
+  },
+  "automation": {
+    "token": "REPLACE_WITH_RANDOM_TOKEN_FOR_UNATTENDED_WRITES"
+  }
 }

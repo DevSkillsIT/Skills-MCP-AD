@@ -722,26 +722,7 @@ class OrganizationalUnitTools(BaseTool):
         """Get child objects of an OU."""
         return self.get_ou_contents(ou_dn)
     
-    def get_ou_permissions(self, ou_dn: str) -> List[Dict[str, Any]]:
-        """Mock method for OU permissions - not implemented in real tool."""
-        return self._format_response({
-            'ou_dn': ou_dn,
-            'permissions': ['Read', 'Write', 'Create Child Objects'],
-            'inherited': True
-        }, "get_ou_permissions")
     
-    def delegate_ou_control(self, ou_dn: str = None, principal: str = None, delegate_dn: str = None,
-                          permissions: List[str] = None, **kwargs) -> List[Dict[str, Any]]:
-        """Mock method for OU delegation - not implemented in real tool."""
-        # Handle both parameter names for backward compatibility
-        if delegate_dn is not None:
-            principal = delegate_dn
-        return self._format_response({
-            'ou_dn': ou_dn,
-            'principal': principal,
-            'delegated_permissions': permissions or [],
-            'success': True
-        }, "delegate_ou_control")
     
     def get_ou_statistics(self, ou_dn: str) -> Dict[str, Any]:
         """Get statistics for an OU."""
@@ -757,16 +738,21 @@ class OrganizationalUnitTools(BaseTool):
             if not contents.get('success', True):
                 return {'success': False, 'error': contents.get('error', 'Unknown error'), 'ou_dn': ou_dn}
                 
+            # get_ou_contents answers with total_count and a type_counts map;
+            # reading total_objects/users_count/... found nothing, so every
+            # statistic came back as zero regardless of the OU's real content.
+            por_tipo = contents.get('type_counts', {})
             stats = {
                 'ou_dn': ou_dn,
-                'total_objects': contents.get('total_objects', 0),
-                'users': contents.get('users_count', 0), 
-                'groups': contents.get('groups_count', 0),
-                'computers': contents.get('computers_count', 0),
-                'sub_ous': contents.get('sub_ous_count', 0)
+                'total_objects': contents.get('total_count', 0),
+                'users': por_tipo.get('user', 0),
+                'groups': por_tipo.get('group', 0),
+                'computers': por_tipo.get('computer', 0),
+                'sub_ous': por_tipo.get('organizationalUnit', 0),
             }
-            
-            return self._format_response(True, stats)
+
+            # Arguments were swapped here too: _format_response(data, operation).
+            return self._format_response(stats, "get_ou_statistics")
             
         except Exception as e:
             return self._handle_ldap_error(e, 'get_ou_statistics', ou_dn)

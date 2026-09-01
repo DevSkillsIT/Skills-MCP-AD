@@ -43,7 +43,11 @@ ENV PYTHONPATH=/app/src
 ENV AD_MCP_CONFIG=/app/ad-config/config.json
 
 # Expose port
-EXPOSE 8813
+# server_fastapi serves /mcp on this port (see main() in server_fastapi.py).
+EXPOSE 8820
 
 # Default command (can be overridden)
-CMD ["/bin/bash", "-c", ". .venv/bin/activate && python -m active_directory_mcp.server_http --host 0.0.0.0 --port 8813 --path /activedirectory-mcp"]
+# server_http.py was removed; server_fastapi.py is the HTTP transport. The
+# path is fixed at /mcp, so there is no --path flag any more. Set
+# AD_MCP_MODE=multi and AD_MCP_SERVERS to serve several directories.
+CMD ["/bin/bash", "-c", ". .venv/bin/activate && python -m active_directory_mcp.server_fastapi --host 0.0.0.0 --port 8820"]

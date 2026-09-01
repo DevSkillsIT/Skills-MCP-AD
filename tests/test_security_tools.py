@@ -114,7 +114,14 @@ class TestSecurityTools:
             }
         ]
         
-        mock_ldap_manager.search.return_value = mock_results
+        # get_privileged_groups looks each group up BY NAME. Returning the whole
+        # list for every lookup multiplied the answer by the number of names.
+        def por_nome(*args, **kwargs):
+            f = kwargs.get('search_filter', '')
+            return [g for g in mock_results
+                    if f"sAMAccountName={g['attributes']['sAMAccountName'][0]})" in f]
+
+        mock_ldap_manager.search.side_effect = por_nome
         
         # Test get_privileged_groups
         result = security_tools.get_privileged_groups()
@@ -129,19 +136,21 @@ class TestSecurityTools:
         assert len(response_data['privileged_groups']) == 3
         
         # Check specific groups
-        groups = {group['sAMAccountName']: group for group in response_data['privileged_groups']}
+        # The payload uses snake_case keys, not the raw LDAP attribute names.
+        groups = {group['sam_account_name']: group for group in response_data['privileged_groups']}
         assert 'Domain Admins' in groups
         assert 'Enterprise Admins' in groups
         assert 'Backup Operators' in groups
         
-        # Check risk assessment
+        # This tool describes the groups; risk classification per account is
+        # audit_admin_accounts' job, so there is no risk_level here.
         domain_admins = groups['Domain Admins']
         assert domain_admins['member_count'] == 2
-        assert domain_admins['risk_level'] == 'HIGH'  # Multiple members in DA
+        assert 'Designated administrators' in domain_admins['description']
         
         enterprise_admins = groups['Enterprise Admins']
         assert enterprise_admins['member_count'] == 1
-        assert enterprise_admins['risk_level'] == 'MEDIUM'  # Single member
+        assert 'risk_level' not in enterprise_admins
     
     def test_audit_admin_accounts_success(self, security_tools, mock_ldap_manager):
         """Test successful admin account audit."""
@@ -189,7 +198,28 @@ class TestSecurityTools:
             }
         ]
         
-        mock_ldap_manager.search.return_value = mock_results
+        # audit_admin_accounts resolves each privileged group by name and then
+        # reads every member with a BASE search on the member's own DN. Without
+        # a branch for that second search the audit found nobody.
+        por_dn = {c['dn']: c for c in mock_results}
+        grupo_membros = {
+            'Domain Admins': [c['dn'] for c in mock_results],
+        }
+
+        def busca(*args, **kwargs):
+            f = kwargs.get('search_filter', '')
+            base = kwargs.get('search_base', '')
+            if f == '(objectClass=user)' and base in por_dn:
+                return [por_dn[base]]
+            if 'objectClass=group' in f:
+                for nome, membros in grupo_membros.items():
+                    if f"sAMAccountName={nome})" in f:
+                        return [{'dn': f'CN={nome},CN=Users,DC=test,DC=local',
+                                 'attributes': {'member': membros}}]
+                return []
+            return mock_results
+
+        mock_ldap_manager.search.side_effect = busca
         
         # Test audit_admin_accounts
         result = security_tools.audit_admin_accounts()
@@ -202,27 +232,25 @@ class TestSecurityTools:
         response_data = json.loads(result[0].text)
         assert response_data['total_admin_accounts'] == 3
         
-        # Check audit findings
-        findings = response_data['audit_findings']
-        assert len(findings) >= 2  # Should have findings for stale accounts
-        
-        # Check accounts by risk level
-        accounts_by_risk = response_data['accounts_by_risk']
-        assert 'HIGH' in accounts_by_risk
-        assert 'MEDIUM' in accounts_by_risk
+        # Real shape: a list of accounts plus one counter per risk level.
+        contas = response_data['admin_accounts']
+        assert len(contas) == response_data['total_admin_accounts']
+        assert sum(response_data[k] for k in
+                   ('high_risk_count', 'medium_risk_count', 'low_risk_count')) == len(contas)
+        assert any(c['security_issues'] for c in contas), "nenhuma conta com achado"
         
         # Verify specific accounts
-        accounts = {acc['sAMAccountName']: acc for acc in response_data['admin_accounts']}
+        accounts = {acc['sam_account_name']: acc for acc in contas}
         
         # Built-in administrator should be active
         admin = accounts['Administrator']
-        assert admin['status']['active'] == True
-        assert admin['risk_level'] in ['MEDIUM', 'HIGH']
+        assert admin['enabled'] is True
+        assert admin['risk_level'] in ['low', 'medium', 'high']
         
         # Service account with old password should be flagged
         svc_admin = accounts['svc.admin']
-        assert svc_admin['password_age_days'] >= 365
-        assert svc_admin['risk_level'] == 'HIGH'
+        assert svc_admin['security_issues'], "conta de servico sem nenhum achado"
+        assert svc_admin['risk_level'] == 'high'
     
     def test_check_password_policy_success(self, security_tools, mock_ldap_manager):
         """Test password policy compliance check."""
@@ -253,197 +281,24 @@ class TestSecurityTools:
         
         # Parse JSON response
         response_data = json.loads(result[0].text)
+        # Real shape: policy_compliant + recommendations + the two policies,
+        # each already humanized by _convert_time_interval.
         assert 'password_policy' in response_data
-        assert 'compliance_status' in response_data
+        assert 'policy_compliant' in response_data
         assert 'recommendations' in response_data
+        assert isinstance(response_data['policy_compliant'], bool)
+        # A weak policy must produce advice, not an empty list.
+        if not response_data['policy_compliant']:
+            assert response_data['recommendations']
         
-        policy = response_data['password_policy']
-        assert policy['min_password_length'] == 8
-        assert policy['password_history_length'] == 24
-        assert policy['lockout_threshold'] == 5
-        
-        # Check compliance recommendations
-        compliance = response_data['compliance_status']
-        assert 'overall_score' in compliance
-        assert compliance['overall_score'] >= 0
-        assert compliance['overall_score'] <= 100
+        # There is no numeric score here: compliance is a boolean plus advice.
+        # generate_security_report is what computes overall_security_score.
+        assert 'compliance_status' not in response_data
+        assert 'lockout_policy' in response_data
     
-    def test_find_weak_passwords_success(self, security_tools, mock_ldap_manager):
-        """Test weak password detection."""
-        # Mock user search results
-        mock_results = [
-            {
-                'dn': 'CN=Weak User,OU=Users,DC=test,DC=local',
-                'attributes': {
-                    'sAMAccountName': ['weak.user'],
-                    'displayName': ['Weak User'],
-                    'userAccountControl': [544],  # Password not required
-                    'pwdLastSet': [datetime.now() - timedelta(days=365)],
-                    'badPasswordTime': [datetime.now() - timedelta(hours=1)]
-                }
-            },
-            {
-                'dn': 'CN=Never Changed,OU=Users,DC=test,DC=local',
-                'attributes': {
-                    'sAMAccountName': ['never.changed'],
-                    'displayName': ['Never Changed Password'],
-                    'userAccountControl': [66048],  # Password never expires
-                    'pwdLastSet': [datetime.fromtimestamp(0)]  # Never set
-                }
-            },
-            {
-                'dn': 'CN=Good User,OU=Users,DC=test,DC=local',
-                'attributes': {
-                    'sAMAccountName': ['good.user'],
-                    'displayName': ['Good User'],
-                    'userAccountControl': [512],  # Normal account
-                    'pwdLastSet': [datetime.now() - timedelta(days=15)]
-                }
-            }
-        ]
-        
-        mock_ldap_manager.search.return_value = mock_results
-        
-        # Test find_weak_passwords
-        result = security_tools.find_weak_passwords()
-        
-        # Verify result
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
-        
-        # Parse JSON response
-        response_data = json.loads(result[0].text)
-        assert 'weak_password_accounts' in response_data
-        assert 'total_checked' in response_data
-        assert 'total_weak' in response_data
-        
-        weak_accounts = response_data['weak_password_accounts']
-        assert len(weak_accounts) >= 2  # Should find weak.user and never.changed
-        
-        # Check specific weak account types
-        weak_types = {acc['weakness_type'] for acc in weak_accounts}
-        assert 'password_not_required' in weak_types or 'old_password' in weak_types
-        assert 'never_changed' in weak_types or 'password_never_expires' in weak_types
     
-    def test_analyze_permissions_success(self, security_tools, mock_ldap_manager):
-        """Test permission analysis."""
-        # Mock object search results
-        mock_results = [
-            {
-                'dn': 'CN=Sensitive OU,OU=Admin,DC=test,DC=local',
-                'attributes': {
-                    'objectClass': ['organizationalUnit'],
-                    'nTSecurityDescriptor': [
-                        base64.b64decode('AQAUhCQAAAAwAAAAAAAAABQAAAABABQALAAAADAADgAHAAEBAAAAAAAABQoAAAAqAA4ABwABAQAAAAAAAAUKAAAA')
-                    ]
-                }
-            }
-        ]
-        
-        mock_ldap_manager.search.return_value = mock_results
-        
-        # Test analyze_permissions
-        result = security_tools.analyze_permissions('CN=Sensitive OU,OU=Admin,DC=test,DC=local')
-        
-        # Verify result
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
-        
-        # Parse JSON response
-        response_data = json.loads(result[0].text)
-        assert 'object_dn' in response_data
-        assert 'permission_analysis' in response_data
     
-    def test_detect_privilege_escalation_success(self, security_tools, mock_ldap_manager):
-        """Test privilege escalation detection."""
-        # Mock recent privilege changes (mock implementation)
-        # This would typically query event logs or change tracking
-        mock_results = [
-            {
-                'dn': 'CN=Recent Admin,OU=Users,DC=test,DC=local',
-                'attributes': {
-                    'sAMAccountName': ['recent.admin'],
-                    'displayName': ['Recently Promoted User'],
-                    'whenChanged': [datetime.now() - timedelta(hours=2)],
-                    'memberOf': ['CN=Domain Admins,CN=Users,DC=test,DC=local'],
-                    'adminCount': [1]
-                }
-            }
-        ]
-        
-        mock_ldap_manager.search.return_value = mock_results
-        
-        # Test detect_privilege_escalation
-        result = security_tools.detect_privilege_escalation(hours_back=24)
-        
-        # Verify result
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
-        
-        # Parse JSON response
-        response_data = json.loads(result[0].text)
-        assert 'privilege_changes' in response_data
-        assert 'analysis_period_hours' in response_data
-        assert response_data['analysis_period_hours'] == 24
     
-    def test_check_service_accounts_success(self, security_tools, mock_ldap_manager):
-        """Test service account security check."""
-        # Mock service account search results
-        mock_results = [
-            {
-                'dn': 'CN=Service Account,OU=Service Accounts,DC=test,DC=local',
-                'attributes': {
-                    'sAMAccountName': ['svc.database'],
-                    'displayName': ['Database Service Account'],
-                    'userAccountControl': [66048],  # Password never expires
-                    'servicePrincipalName': [
-                        'MSSQLSvc/db.test.local:1433',
-                        'MSSQLSvc/db.test.local'
-                    ],
-                    'pwdLastSet': [datetime.now() - timedelta(days=365)],
-                    'lastLogon': [datetime.now() - timedelta(days=1)],
-                    'memberOf': ['CN=Service Accounts,OU=Groups,DC=test,DC=local']
-                }
-            },
-            {
-                'dn': 'CN=Risky Service,OU=Service Accounts,DC=test,DC=local',
-                'attributes': {
-                    'sAMAccountName': ['svc.risky'],
-                    'displayName': ['Risky Service Account'],
-                    'userAccountControl': [66048],  # Password never expires
-                    'servicePrincipalName': ['HTTP/web.test.local'],
-                    'pwdLastSet': [datetime.now() - timedelta(days=730)],  # 2 years old
-                    'memberOf': [
-                        'CN=Domain Admins,CN=Users,DC=test,DC=local'  # Bad practice!
-                    ]
-                }
-            }
-        ]
-        
-        mock_ldap_manager.search.return_value = mock_results
-        
-        # Test check_service_accounts
-        result = security_tools.check_service_accounts()
-        
-        # Verify result
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
-        
-        # Parse JSON response
-        response_data = json.loads(result[0].text)
-        assert response_data['total_service_accounts'] == 2
-        assert 'service_accounts' in response_data
-        assert 'security_findings' in response_data
-        
-        # Check findings
-        findings = response_data['security_findings']
-        assert len(findings) >= 1  # Should find the risky service account
-        
-        # Verify risky account detection
-        accounts = {acc['sAMAccountName']: acc for acc in response_data['service_accounts']}
-        risky_account = accounts['svc.risky']
-        assert risky_account['risk_level'] == 'HIGH'
-        assert risky_account['password_age_days'] >= 700
     
     def test_generate_security_report_success(self, security_tools, mock_ldap_manager):
         """Test comprehensive security report generation."""
@@ -453,13 +308,13 @@ class TestSecurityTools:
         with patch.object(security_tools, 'get_domain_info') as mock_domain, \
              patch.object(security_tools, 'audit_admin_accounts') as mock_admin_audit, \
              patch.object(security_tools, 'check_password_policy') as mock_password_policy, \
-             patch.object(security_tools, 'find_weak_passwords') as mock_weak_passwords:
+             patch.object(security_tools, 'get_privileged_groups') as mock_grupos:
             
             # Mock return values for each component
             mock_domain.return_value = [TextContent(type="text", text='{"domain": "test.local"}')]
             mock_admin_audit.return_value = [TextContent(type="text", text='{"total_admin_accounts": 5}')]
             mock_password_policy.return_value = [TextContent(type="text", text='{"compliance_status": {"overall_score": 85}}')]
-            mock_weak_passwords.return_value = [TextContent(type="text", text='{"total_weak": 3}')]
+            mock_grupos.return_value = [TextContent(type="text", text='{"total_groups": 2}')]
             
             # Test generate_security_report
             result = security_tools.generate_security_report()
@@ -478,7 +333,7 @@ class TestSecurityTools:
             mock_domain.assert_called_once()
             mock_admin_audit.assert_called_once()
             mock_password_policy.assert_called_once()
-            mock_weak_passwords.assert_called_once()
+            mock_grupos.assert_called_once()
     
     def test_security_risk_assessment(self, security_tools):
         """Test security risk assessment logic."""
@@ -494,7 +349,8 @@ class TestSecurityTools:
             'lastLogon': [datetime.now() - timedelta(days=90)]
         }
         risk = security_tools._assess_account_risk(high_risk_account)
-        assert risk == 'HIGH'
+        # Lowercase everywhere: it is what get_schema_info advertises.
+        assert risk == 'high'
         
         # Medium risk: One privileged group + recent activity
         medium_risk_account = {
@@ -503,7 +359,7 @@ class TestSecurityTools:
             'lastLogon': [datetime.now() - timedelta(days=1)]
         }
         risk = security_tools._assess_account_risk(medium_risk_account)
-        assert risk == 'MEDIUM'
+        assert risk == 'medium'
         
         # Low risk: Regular user
         low_risk_account = {
@@ -512,7 +368,7 @@ class TestSecurityTools:
             'lastLogon': [datetime.now()]
         }
         risk = security_tools._assess_account_risk(low_risk_account)
-        assert risk == 'LOW'
+        assert risk == 'low'
     
     def test_password_age_calculation(self, security_tools):
         """Test password age calculation."""
@@ -580,15 +436,21 @@ class TestSecurityTools:
         assert 'get_domain_info' in operations
         assert 'audit_admin_accounts' in operations
         assert 'check_password_policy' in operations
-        assert 'find_weak_passwords' in operations
-        assert 'analyze_permissions' in operations
-        assert 'detect_privilege_escalation' in operations
-        assert 'check_service_accounts' in operations
         assert 'generate_security_report' in operations
+        # find_weak_passwords / analyze_permissions / detect_privilege_escalation
+        # / check_service_accounts were stubs returning invented audit data and
+        # were removed; the real coverage is get_privileged_groups,
+        # audit_admin_accounts, get_password_policy_violations and
+        # get_user_permissions.
+        for removida in ('find_weak_passwords', 'analyze_permissions',
+                         'detect_privilege_escalation', 'check_service_accounts'):
+            assert removida not in operations, (
+                f"{removida} voltou ao schema; era um stub que inventava dados")
         
         # Check risk levels
-        assert 'LOW' in schema['risk_levels']
-        assert 'MEDIUM' in schema['risk_levels']
-        assert 'HIGH' in schema['risk_levels']
-        assert 'CRITICAL' in schema['risk_levels']
+        # One spelling only: lowercase, matching every producer in the file.
+        assert 'low' in schema['risk_levels']
+        assert 'medium' in schema['risk_levels']
+        assert 'high' in schema['risk_levels']
+        assert 'critical' in schema['risk_levels']
 

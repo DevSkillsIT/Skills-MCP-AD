@@ -130,7 +130,8 @@ class LDAPManager:
     def __init__(self, 
                  ad_config: ActiveDirectoryConfig,
                  security_config: SecurityConfig,
-                 performance_config: PerformanceConfig):
+                 performance_config: PerformanceConfig,
+                 ou_config=None):
         """
         Initialize LDAP manager.
         
@@ -142,6 +143,9 @@ class LDAPManager:
         self.ad_config = ad_config
         self.security_config = security_config
         self.performance_config = performance_config
+        # Organizational units are not part of ActiveDirectoryConfig; the tools
+        # reach them through here when deciding where to create an object.
+        self.ou_config = ou_config
         
         self._connection: Optional[Connection] = None
         self._server_pool: Optional[List[Server]] = None
@@ -419,6 +423,19 @@ class LDAPManager:
                 )
                 
                 if not success:
+                    # @MX:ANCHOR ldap3 returns False for a BASE search whose
+                    # filter matches nothing, even though the operation
+                    # succeeded (result 0). Raising on the boolean alone turned
+                    # "nothing matched" into an error and aborted whole audits:
+                    # one nested group inside Domain Admins was enough to make
+                    # audit_admin_accounts report zero administrative accounts
+                    # for a domain that has thirteen.
+                    codigo = (connection.result or {}).get('result')
+                    if codigo in (0, 32):  # success / noSuchObject
+                        logger.debug(
+                            "Search returned no entries (result=%s): base=%s filter=%s",
+                            codigo, search_base, search_filter)
+                        break
                     logger.error(f"Search failed: {connection.result}")
                     raise LDAPException(f"Search failed: {connection.result}")
                 

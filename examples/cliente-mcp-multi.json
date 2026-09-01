@@ -1,0 +1,10 @@
+{
+  "_comment": "Como um cliente MCP (Claude Code, Cursor, mcphub) se conecta a instancia multi-AD. O token NAO fica neste arquivo: headersHelper le do .env, que tem permissao 600 e esta fora do git.",
+  "mcpServers": {
+    "ad-multi": {
+      "type": "http",
+      "url": "http://127.0.0.1:8853/mcp",
+      "headersHelper": "/caminho/para/mcp-headers-from-env.sh /caminho/para/multi/.env AD_MCP_API_TOKEN"
+    }
+  }
+}

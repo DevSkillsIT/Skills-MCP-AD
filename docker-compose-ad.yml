@@ -41,10 +41,9 @@ services:
     environment:
       - AD_MCP_CONFIG=/app/ad-config/ad-config.json
       - HTTP_HOST=0.0.0.0
-      - HTTP_PORT=8813
-      - HTTP_PATH=/activedirectory-mcp
+      - HTTP_PORT=8820
     ports:
-      - "8813:8813"
+      - "8820:8820"
     volumes:
       - ./ad-config:/app/ad-config:ro
     networks:

@@ -3,7 +3,7 @@
 import json
 from typing import List, Dict, Any, Optional
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from mcp.types import TextContent as Content
 from ldap3.core.exceptions import LDAPException
@@ -199,6 +199,65 @@ class BaseTool(ABC):
             Dictionary with schema information
         """
         pass
+
+    # Windows FILETIME epoch and the "never expires" sentinel.
+    _FILETIME_EPOCH = datetime(1601, 1, 1)
+    _NEVER_EXPIRES = 9223372036854775807
+
+    # AD default containers, present in every domain.
+    _CONTAINER_PADRAO = {"users": "CN=Users", "groups": "CN=Users",
+                         "computers": "CN=Computers", "service_accounts": "CN=Users"}
+
+    def _default_ou(self, kind: str) -> str:
+        """Where to create an object when the caller did not say.
+
+        @MX:ANCHOR group.py and computer.py used to read
+        ad_config.organizational_units, a field ActiveDirectoryConfig never had:
+        creating without an explicit OU raised AttributeError, and the
+        configured OUs were dead letters. The unit tests missed it because they
+        mocked ad_config with a bare Mock, which answers any attribute.
+        """
+        ou_config = getattr(self.ldap, "ou_config", None)
+        if ou_config is not None:
+            valor = getattr(ou_config, f"{kind}_ou", None)
+            if valor:
+                return valor
+        return f"{self._CONTAINER_PADRAO.get(kind, 'CN=Users')},{self.ldap.ad_config.base_dn}"
+
+    def _as_filetime(self, value) -> int:
+        """Normalize an AD time attribute to FILETIME ticks (100ns).
+
+        @MX:ANCHOR ldap3 decodes AD time attributes inconsistently: an int for
+        raw values, a datetime for Generalized-Time (pwdLastSet, accountExpires,
+        lastLogon) and a timedelta for the Interval syntax (maxPwdAge). Code that
+        compares the raw value against an int is right for one form and silently
+        wrong for the others. Every arithmetic use must pass through here.
+        """
+        if value is None or isinstance(value, bool):
+            return 0
+        if isinstance(value, datetime):
+            dt = value
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            return int((dt - self._FILETIME_EPOCH).total_seconds() * 10000000)
+        if isinstance(value, timedelta):
+            return int(value.total_seconds() * 10000000)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    def _now_filetime(self) -> int:
+        """Current time as FILETIME ticks. AD stores these in UTC."""
+        return self._as_filetime(datetime.now(timezone.utc))
+
+    def _never_expires_floor(self) -> int:
+        """Any accountExpires at or above this means "never".
+
+        Covers both forms: the int sentinel and the year-9999 datetime ldap3
+        produces from it.
+        """
+        return self._as_filetime(datetime(9999, 1, 1))
 
     def _get_attr(self, attributes: Dict, key: str, default=None):
         """

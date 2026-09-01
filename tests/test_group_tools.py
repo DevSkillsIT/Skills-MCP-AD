@@ -6,16 +6,25 @@ import json
 
 from active_directory_mcp.tools.group import GroupTools
 from mcp.types import TextContent
+from active_directory_mcp.config.models import (
+    ActiveDirectoryConfig, OrganizationalUnitsConfig)
 
 
 @pytest.fixture
 def mock_ldap_manager():
     """Mock LDAP manager for testing."""
     manager = Mock()
-    manager.ad_config = Mock()
-    manager.ad_config.base_dn = "DC=test,DC=local"
-    manager.ad_config.organizational_units = Mock()
-    manager.ad_config.organizational_units.groups_ou = "OU=Groups,DC=test,DC=local"
+    # The real ActiveDirectoryConfig has no organizational_units field; the OUs
+    # live on the manager as ou_config. Mocking the old shape is what let the
+    # AttributeError in create_group reach production unnoticed.
+    manager.ad_config = ActiveDirectoryConfig(
+        server="ldap://test.local:389", domain="test.local",
+        base_dn="DC=test,DC=local", bind_dn="CN=svc,DC=test,DC=local", password="x")
+    manager.ou_config = OrganizationalUnitsConfig(
+        users_ou="OU=Users,DC=test,DC=local",
+        groups_ou="OU=Groups,DC=test,DC=local",
+        computers_ou="OU=Computers,DC=test,DC=local",
+        service_accounts_ou="OU=Service Accounts,DC=test,DC=local")
     return manager
 
 
@@ -503,7 +512,9 @@ class TestGroupTools:
         assert group_tools._get_group_scope(0x00000002) == "Global"  # Global group
         assert group_tools._get_group_scope(0x00000004) == "DomainLocal"  # Domain Local
         assert group_tools._get_group_scope(0x00000008) == "Universal"  # Universal
-        assert group_tools._get_group_scope(0x12345678) == "Unknown"  # Unknown type
+        # 0x12345678 has bit 0x8 set, so it IS Universal -- that value never
+        # exercised the unknown branch. 0x12345670 has no scope bit at all.
+        assert group_tools._get_group_scope(0x12345670) == "Unknown"
     
     def test_group_type_calculation(self, group_tools):
         """Test group type calculation from groupType value."""

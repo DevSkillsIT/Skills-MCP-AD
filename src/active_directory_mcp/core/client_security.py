@@ -72,7 +72,7 @@ class ClientSecurityManager:
     def _derive_client_name(self) -> str:
         """Derive client name from config path or domain."""
         if self.config_path:
-            # Extract from path: /opt/mcp-servers/active-directory/{client}/ad-config/...
+            # Extract from path: .../active-directory/{client}/ad-config/...
             path_parts = Path(self.config_path).parts
             for i, part in enumerate(path_parts):
                 if part == "active-directory" and i + 1 < len(path_parts):
@@ -190,10 +190,16 @@ class ClientSecurityManager:
         if client_confirmation:
             # Normalize for comparison
             confirmed_slug = client_confirmation.lower().strip().replace(" ", "-")
+            # Every name that unambiguously points at THIS tenant. A model that
+            # confirms with the full domain ("exemplo.local") rather than the
+            # slug is being precise, not wrong; refusing that only trains it to
+            # guess.
             expected_slugs = [
-                self.client_slug,
+                self.client_slug.lower(),
                 self.client_name.lower().replace(" ", "-"),
-                self.domain.split(".")[0].lower()
+                self.domain.lower(),
+                self.domain.split(".")[0].lower(),
+                self.base_dn.lower().replace(" ", ""),
             ]
             
             if confirmed_slug in expected_slugs:

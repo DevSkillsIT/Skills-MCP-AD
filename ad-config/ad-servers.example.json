@@ -1,0 +1,50 @@
+{
+  "_comment": "Template do modo MULTI-AD (AD_MCP_MODE=multi). Cada bloco em 'servers' e um ad-config.json completo, mais os metadados de identificacao. Copie para fora do repositorio, preencha e aponte AD_MCP_SERVERS para ele com permissao 600.",
+  "version": 1,
+  "servers": {
+    "cliente-exemplo": {
+      "label": "Cliente Exemplo",
+      "aliases": ["exemplo", "cli-exemplo"],
+      "enabled": true,
+      "dc_hostname": "DCEXEMPLO01.exemplo.local",
+      "netbios_domain": "EXEMPLO.LOCAL",
+      "site": "Default-First-Site-Name",
+      "notes": "Campo livre: particularidades deste AD (formato de bind, ausencia de LDAPS, etc).",
+      "active_directory": {
+        "server": "ldaps://10.0.0.10:636",
+        "server_pool": ["ldaps://10.0.0.11:636"],
+        "use_ssl": true,
+        "ssl_port": 636,
+        "domain": "exemplo.local",
+        "base_dn": "DC=exemplo,DC=local",
+        "bind_dn": "svc-mcp@exemplo.local",
+        "password": "SUBSTITUA_PELA_SENHA_REAL",
+        "timeout": 30,
+        "auto_bind": true,
+        "receive_timeout": 10
+      },
+      "organizational_units": {
+        "users_ou": "CN=Users,DC=exemplo,DC=local",
+        "groups_ou": "CN=Users,DC=exemplo,DC=local",
+        "computers_ou": "CN=Computers,DC=exemplo,DC=local",
+        "service_accounts_ou": "CN=Users,DC=exemplo,DC=local"
+      },
+      "security": {
+        "enable_tls": true,
+        "validate_certificate": false,
+        "require_secure_connection": false
+      },
+      "performance": {
+        "connection_pool_size": 5,
+        "max_retries": 3,
+        "retry_delay": 1.0,
+        "page_size": 100
+      },
+      "client": {
+        "name": "Cliente Exemplo",
+        "slug": "cliente-exemplo",
+        "type": "cliente"
+      }
+    }
+  }
+}

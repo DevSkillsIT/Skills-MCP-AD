@@ -7,17 +7,22 @@ from datetime import datetime, timedelta
 
 from active_directory_mcp.tools.computer import ComputerTools
 from mcp.types import TextContent
+from active_directory_mcp.config.models import (
+    ActiveDirectoryConfig, OrganizationalUnitsConfig)
 
 
 @pytest.fixture
 def mock_ldap_manager():
     """Mock LDAP manager for testing."""
     manager = Mock()
-    manager.ad_config = Mock()
-    manager.ad_config.base_dn = "DC=test,DC=local"
-    manager.ad_config.organizational_units = Mock()
-    manager.ad_config.organizational_units.computers_ou = "OU=Computers,DC=test,DC=local"
-    manager.ad_config.domain = "test.local"
+    manager.ad_config = ActiveDirectoryConfig(
+        server="ldap://test.local:389", domain="test.local",
+        base_dn="DC=test,DC=local", bind_dn="CN=svc,DC=test,DC=local", password="x")
+    manager.ou_config = OrganizationalUnitsConfig(
+        users_ou="OU=Users,DC=test,DC=local",
+        groups_ou="OU=Groups,DC=test,DC=local",
+        computers_ou="OU=Computers,DC=test,DC=local",
+        service_accounts_ou="OU=Service Accounts,DC=test,DC=local")
     return manager
 
 
@@ -377,16 +382,16 @@ class TestComputerTools:
         # Test get_computer_status
         result = computer_tools.get_computer_status('STATUSPC')
         
-        # Verify result
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
-        
-        # Parse JSON response
-        response_data = json.loads(result[0].text)
+        # These three return a plain dict (they wrap the List[TextContent]
+        # tools and parse the payload), so there is no TextContent envelope.
+        response_data = result
+        # Flat shape, and no 'online'/'domain_trust_ok': those were hardcoded
+        # True without ever pinging or checking a trust, so they were removed.
         assert response_data['computer_name'] == 'STATUSPC'
-        assert response_data['status']['enabled'] == True
-        assert response_data['status']['online'] == True  # Recently logged on
-        assert 'days_since_password_change' in response_data['status']
+        assert response_data['enabled'] == True
+        assert 'password_age_days' in response_data
+        assert 'online' not in response_data, "campo nao medido voltou"
+        assert 'domain_trust_ok' not in response_data, "campo nao medido voltou"
     
     def test_search_stale_computers_success(self, computer_tools, mock_ldap_manager):
         """Test successful stale computer search."""
@@ -422,18 +427,15 @@ class TestComputerTools:
         # Test search_stale_computers with 30-day threshold
         result = computer_tools.search_stale_computers(days_inactive=30)
         
-        # Verify result
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
-        
-        # Parse JSON response
-        response_data = json.loads(result[0].text)
-        assert response_data['threshold_days'] == 30
+        # These three return a plain dict (they wrap the List[TextContent]
+        # tools and parse the payload), so there is no TextContent envelope.
+        response_data = result
+        assert response_data['days_threshold'] == 30
         
         # Should find only the stale computer (90 days > 30 days threshold)
         stale_computers = response_data['stale_computers']
         assert len(stale_computers) == 1
-        assert stale_computers[0]['sAMAccountName'] == 'STALEPC1$'
+        assert stale_computers[0]['computer_name'] == 'STALEPC1$'
         assert stale_computers[0]['days_inactive'] >= 30
     
     def test_get_computer_groups_success(self, computer_tools, mock_ldap_manager):
@@ -481,20 +483,17 @@ class TestComputerTools:
         # Test get_computer_groups
         result = computer_tools.get_computer_groups('MEMBERPC')
         
-        # Verify result
-        assert len(result) == 1
-        assert isinstance(result[0], TextContent)
-        
-        # Parse JSON response
-        response_data = json.loads(result[0].text)
+        # These three return a plain dict (they wrap the List[TextContent]
+        # tools and parse the payload), so there is no TextContent envelope.
+        response_data = result
         assert response_data['computer_name'] == 'MEMBERPC'
         assert response_data['group_count'] == 2
         assert len(response_data['groups']) == 2
         
         # Check group information
         groups = response_data['groups']
-        assert groups[0]['sAMAccountName'] == 'Domain Computers'
-        assert groups[1]['sAMAccountName'] == 'Workstations'
+        assert groups[0]['group_name'] == 'Domain Computers'
+        assert groups[1]['group_name'] == 'Workstations'
     
     def test_computer_account_control_checks(self, computer_tools):
         """Test computer account control flag checking."""

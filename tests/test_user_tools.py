@@ -6,17 +6,22 @@ import json
 
 from active_directory_mcp.tools.user import UserTools
 from mcp.types import TextContent
+from active_directory_mcp.config.models import (
+    ActiveDirectoryConfig, OrganizationalUnitsConfig)
 
 
 @pytest.fixture
 def mock_ldap_manager():
     """Mock LDAP manager for testing."""
     manager = Mock()
-    manager.ad_config = Mock()
-    manager.ad_config.base_dn = "DC=test,DC=local"
-    manager.ad_config.organizational_units = Mock()
-    manager.ad_config.organizational_units.users_ou = "OU=Users,DC=test,DC=local"
-    manager.ad_config.domain = "test.local"
+    manager.ad_config = ActiveDirectoryConfig(
+        server="ldap://test.local:389", domain="test.local",
+        base_dn="DC=test,DC=local", bind_dn="CN=svc,DC=test,DC=local", password="x")
+    manager.ou_config = OrganizationalUnitsConfig(
+        users_ou="OU=Users,DC=test,DC=local",
+        groups_ou="OU=Groups,DC=test,DC=local",
+        computers_ou="OU=Computers,DC=test,DC=local",
+        service_accounts_ou="OU=Service Accounts,DC=test,DC=local")
     return manager
 
 
@@ -256,8 +261,11 @@ class TestUserTools:
     def test_reset_password_with_generated_password(self, user_tools, mock_ldap_manager):
         """Test password reset with auto-generated password."""
         # Mock search for user
+        # LDAPManager.search always returns dn + attributes; omitting
+        # 'attributes' made the tool raise KeyError and report success=False.
         mock_ldap_manager.search.return_value = [
-            {'dn': 'CN=Test User,OU=Users,DC=test,DC=local'}
+            {'dn': 'CN=Test User,OU=Users,DC=test,DC=local',
+             'attributes': {'sAMAccountName': 'testuser', 'userAccountControl': 512}}
         ]
         
         # Mock successful modify operations

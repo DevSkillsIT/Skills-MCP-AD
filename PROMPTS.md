@@ -5,8 +5,10 @@
 This MCP ships with **15 professional MSP prompts** &mdash; multi-step playbooks that help AI assistants execute auditing, compliance, troubleshooting, onboarding and offboarding tasks against Active Directory.
 
 **Module:** `tools/prompts.py`
-**Listed via:** `ad_list_msp_prompts`
-**Executed via:** `ad_execute_msp_prompt`
+**Listed via:** the standard MCP `prompts/list` JSON-RPC method
+**Executed via:** the standard MCP `prompts/get` JSON-RPC method
+
+These are **not tools** &mdash; there is no `ad_list_msp_prompts` or `ad_execute_msp_prompt` tool to call. They are served through the MCP prompts protocol, and only over the Streamable HTTP transport (`server_fastapi.py`); the stdio transport (`server.py`) does not register them.
 
 ---
 
@@ -67,34 +69,33 @@ Focused on support, troubleshooting and daily operations.
 ### List available prompts
 
 ```bash
-curl -X POST http://localhost:8813/activedirectory-mcp \
+curl -X POST http://localhost:8820/mcp \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer YOUR_TOKEN' \
   -d '{
     "jsonrpc": "2.0",
-    "method": "tools/call",
-    "params": { "name": "ad_list_msp_prompts", "arguments": {} },
+    "method": "prompts/list",
+    "params": {},
     "id": 1
   }'
 ```
+
+Returns `{"prompts": [...]}` &mdash; a flat array of all 15 entries, each with `name`, `description` and `arguments`. The manager/analyst grouping below is a documentation convenience; the response itself does not carry a category field.
 
 ### Execute a specific prompt
 
 #### Example 1: Security audit (manager)
 
 ```bash
-curl -X POST http://localhost:8813/activedirectory-mcp \
+curl -X POST http://localhost:8820/mcp \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer YOUR_TOKEN' \
   -d '{
     "jsonrpc": "2.0",
-    "method": "tools/call",
+    "method": "prompts/get",
     "params": {
-      "name": "ad_execute_msp_prompt",
-      "arguments": {
-        "name": "ad_security_audit",
-        "arguments": { "include_disabled": false }
-      }
+      "name": "ad_security_audit",
+      "arguments": { "include_disabled": false }
     },
     "id": 1
   }'
@@ -109,18 +110,15 @@ What happens:
 #### Example 2: User lookup (analyst)
 
 ```bash
-curl -X POST http://localhost:8813/activedirectory-mcp \
+curl -X POST http://localhost:8820/mcp \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer YOUR_TOKEN' \
   -d '{
     "jsonrpc": "2.0",
-    "method": "tools/call",
+    "method": "prompts/get",
     "params": {
-      "name": "ad_execute_msp_prompt",
-      "arguments": {
-        "name": "ad_user_lookup",
-        "arguments": { "search_term": "jdoe" }
-      }
+      "name": "ad_user_lookup",
+      "arguments": { "search_term": "jdoe" }
     },
     "id": 1
   }'
@@ -135,18 +133,15 @@ What happens:
 #### Example 3: Password reset (analyst)
 
 ```bash
-curl -X POST http://localhost:8813/activedirectory-mcp \
+curl -X POST http://localhost:8820/mcp \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer YOUR_TOKEN' \
   -d '{
     "jsonrpc": "2.0",
-    "method": "tools/call",
+    "method": "prompts/get",
     "params": {
-      "name": "ad_execute_msp_prompt",
-      "arguments": {
-        "name": "ad_password_reset_guide",
-        "arguments": { "username": "jdoe" }
-      }
+      "name": "ad_password_reset_guide",
+      "arguments": { "username": "jdoe" }
     },
     "id": 1
   }'
@@ -163,24 +158,44 @@ What happens:
 
 ## Multi-tenant integration
 
-The prompts are tenant-aware. If you run multiple MCP instances (one per tenant), each instance executes the playbook against its own AD &mdash; no extra parameter is needed.
+### Single mode (one process per tenant)
+
+The prompts are tenant-aware. If you run multiple MCP instances (one per tenant, `AD_MCP_MODE=single`), each instance executes the playbook against its own AD &mdash; no extra parameter is needed.
 
 ```json
 {
   "mcpServers": {
     "ad-tenant-a": {
       "type": "streamable-http",
-      "url": "http://ad-mcp.internal:8821/activedirectory-mcp",
+      "url": "http://ad-mcp.internal:8821/mcp",
       "headers": { "Authorization": "Bearer TOKEN_TENANT_A" }
     },
     "ad-tenant-b": {
       "type": "streamable-http",
-      "url": "http://ad-mcp.internal:8822/activedirectory-mcp",
+      "url": "http://ad-mcp.internal:8822/mcp",
       "headers": { "Authorization": "Bearer TOKEN_TENANT_B" }
     }
   }
 }
 ```
+
+### Multi mode (one process serving N directories)
+
+When the instance runs with `AD_MCP_MODE=multi` (see [HTTP_MCP_GUIDE.md](HTTP_MCP_GUIDE.md#single-vs-multi-mode)), every `prompts/get` call must include `ad_server` inside `arguments`, naming exactly one configured directory; it is stripped out before being passed to the prompt itself:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "prompts/get",
+  "params": {
+    "name": "ad_user_lookup",
+    "arguments": { "ad_server": "tenant-a", "search_term": "jdoe" }
+  },
+  "id": 1
+}
+```
+
+An unresolvable or omitted `ad_server` fails the call with a JSON-RPC `error` object naming the problem (unlike the directory-bound tools, which return the same kind of refusal as a normal successful result). Call `ad_list_ad_servers` first if you don't know the exact value to pass.
 
 ---
 
@@ -232,14 +247,16 @@ Compliance: LGPD, GDPR (90-day retention)
 
 ## Troubleshooting
 
-### "Prompt not found"
+### "Prompt não encontrado: \<name\>"
 
-**Cause:** typo in the prompt name.
-**Fix:** call `ad_list_msp_prompts` to get the canonical list.
+**Cause:** typo in the prompt name, or the name isn't one of the 15 in the catalog.
+**Behavior:** `prompts/get` fails as a JSON-RPC `error` (protocol-level, not a normal result) &mdash; the request never reaches the prompt handler.
+**Fix:** call `prompts/list` to get the canonical list of names.
 
-### "Required argument missing"
+### "Parâmetro '\<arg\>' é obrigatório"
 
-**Cause:** required argument not provided.
+**Cause:** a required argument was not provided.
+**Behavior:** unlike an unknown name, this comes back as a normal successful `prompts/get` result whose message text is JSON with `success: false` and the missing parameter's name.
 **Fix:** consult the table above for the prompt's required arguments.
 
 ### "Prompt returns instructions but does not execute"

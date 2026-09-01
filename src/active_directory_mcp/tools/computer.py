@@ -191,7 +191,7 @@ class ComputerTools(BaseTool):
             
             # Determine OU
             if ou is None:
-                ou = self.ldap.ad_config.organizational_units.computers_ou
+                ou = self._default_ou("computers")
             
             # Build DN
             computer_dn = f"CN={computer_cn},{ou}"
@@ -611,18 +611,32 @@ class ComputerTools(BaseTool):
         except Exception:
             return None
     
-    def _convert_filetime_to_datetime(self, filetime) -> datetime:
-        """Convert Windows FILETIME to datetime."""
-        # If already datetime, return as is
+    def _convert_filetime_to_datetime(self, filetime) -> Optional[datetime]:
+        """Convert an AD timestamp to datetime, or None when unreadable.
+
+        @MX:ANCHOR This used to end in `return datetime.now()`. Anything it did
+        not recognise -- above all the ISO string a value becomes after a JSON
+        round trip -- was reported as "just now", so a machine idle for months
+        showed 0 days of inactivity and never appeared in the stale list. An
+        unknown timestamp must read as unknown, never as the reassuring answer.
+        """
         if isinstance(filetime, datetime):
             return filetime
-            
-        # Convert integer FILETIME (100-nanosecond intervals since January 1, 1601)
-        if isinstance(filetime, (int, float)) and filetime != 0:
+
+        # Integer FILETIME: 100-nanosecond intervals since January 1, 1601.
+        if isinstance(filetime, (int, float)) and not isinstance(filetime, bool):
+            if filetime == 0:
+                return None
             return datetime(1601, 1, 1) + timedelta(microseconds=filetime / 10)
-        
-        # Default fallback
-        return datetime.now()
+
+        # ISO string: what this value looks like once it has been serialized.
+        if isinstance(filetime, str):
+            try:
+                return datetime.fromisoformat(filetime)
+            except ValueError:
+                return None
+
+        return None
     
     def _convert_datetime_to_filetime(self, dt: datetime) -> int:
         """Convert datetime to Windows FILETIME."""
@@ -646,22 +660,23 @@ class ComputerTools(BaseTool):
             if not computer_info.get('success', True):
                 return {'success': False, 'error': computer_info.get('error', 'Unknown error'), 'computer_name': computer_name}
                 
-            # Extract computer data from response
-            if 'attributes' in computer_info:
-                data = computer_info['attributes']
-            elif 'computed' in computer_info:
-                data = computer_info['computed']
-            else:
-                data = computer_info
+            # get_computer splits its answer in two: raw LDAP values under
+            # 'attributes' and derived flags under 'computed'. Picking only the
+            # first meant 'enabled' was never found and every computer was
+            # reported as disabled.
+            atributos = computer_info.get('attributes') or {}
+            computado = computer_info.get('computed') or {}
+            data = {**atributos, **computado} if (atributos or computado) else computer_info
                 
             status = {
                 'computer_name': computer_name,
                 'enabled': data.get('enabled', False),
-                'online': True,  # Mock - would need actual ping/connectivity check
                 'last_logon_days': self._get_days_since_last_logon(data) if 'lastLogon' in data else 0,
                 'password_age_days': self._get_password_age_days(data) if 'pwdLastSet' in data else 0,
                 'operating_system': self._get_attr(data, 'operatingSystem', 'Unknown') if isinstance(data.get('operatingSystem'), list) else data.get('operatingSystem', 'Unknown'),
-                'domain_trust_ok': True  # Mock - would need actual trust verification
+                # 'online' and 'domain_trust_ok' used to be hardcoded True here.
+                # Neither was measured: no ping, no trust check. A field that
+                # always says "yes" is worse than an absent field.
             }
             
             return status

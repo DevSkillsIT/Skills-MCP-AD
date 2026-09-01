@@ -166,6 +166,15 @@ cython_debug/
 # Block ALL real configs (any *.json under ad-config/) but allow *.example.json templates
 ad-config/*.json
 !ad-config/*.example.json
+
+# The same protection outside ad-config/: a config parked anywhere else carries
+# the very same credentials. Verified with `git check-ignore` against the paths
+# a hurried operator actually creates.
+**/*ad-servers*.json
+**/*ad-config*.json
+configs/
+**/configs/*.json
+!**/*.example.json
 *.log
 *.pem
 *.crt

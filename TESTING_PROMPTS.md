@@ -1,21 +1,21 @@
 # Testing the MSP Prompts
 
-End-to-end test plan for the 15 MSP prompts exposed by `ad_list_msp_prompts` and `ad_execute_msp_prompt`.
+End-to-end test plan for the 15 MSP prompts exposed via the MCP `prompts/list` and `prompts/get` methods.
 
 ## Prerequisites
 
-- The MCP server is running (HTTP transport, `server_http.py`).
+- The MCP server is running over the Streamable HTTP transport (`server_fastapi.py`) &mdash; the stdio transport (`server.py`) does not expose these prompts.
 - A tenant `ad-config.json` is configured and the server can reach LDAP.
-- You have a Bearer token if `automation.token` is configured in your tenant config.
+- You have a Bearer token if `AD_MCP_API_TOKEN` is set for the instance.
 
-> Throughout this document we use `https://ad-mcp.example.com:8813/activedirectory-mcp` as the endpoint and `YOUR_TOKEN` as the Bearer. Replace both with your real values.
+> Throughout this document we use `https://ad-mcp.example.com:8820/mcp` as the endpoint and `YOUR_TOKEN` as the Bearer. Replace both with your real values. Prompts are invoked with the MCP `prompts/list` and `prompts/get` JSON-RPC methods, not with `tools/call` &mdash; there is no `ad_list_msp_prompts` or `ad_execute_msp_prompt` tool.
 
 ---
 
 ## 1. Health check
 
 ```bash
-curl -X POST https://ad-mcp.example.com:8813/activedirectory-mcp \
+curl -X POST https://ad-mcp.example.com:8820/mcp \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer YOUR_TOKEN' \
   -d '{
@@ -26,43 +26,42 @@ curl -X POST https://ad-mcp.example.com:8813/activedirectory-mcp \
   }'
 ```
 
-Expected: `status: ok`, `ldap_verified: true`.
+Expected: `status: ok`, `ldap_connection: connected` (single mode) &mdash; the field is `ldap_connection`, not `ldap_verified`.
 
 ## 2. List available prompts
 
 ```bash
-curl -X POST https://ad-mcp.example.com:8813/activedirectory-mcp \
+curl -X POST https://ad-mcp.example.com:8820/mcp \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer YOUR_TOKEN' \
   -d '{
     "jsonrpc": "2.0",
-    "method": "tools/call",
-    "params": { "name": "ad_list_msp_prompts", "arguments": {} },
+    "method": "prompts/list",
+    "params": {},
     "id": 1
   }'
 ```
 
-Expected: `total: 15`, two categories (`managers`, `analysts`).
+Expected: `prompts` is a flat array of 15 entries (7 manager + 8 analyst, see below); the response carries no `total` or category field of its own.
 
 ---
 
 ## 3. Manager prompts
 
+Every call below uses `"method": "prompts/get"`; the ellipsis (`...`) in later sections stands in for the `"name"` / `"arguments"` pair inside `"params"`, following the full example in 3.1.
+
 ### 3.1 `ad_security_audit`
 
 ```bash
-curl -X POST https://ad-mcp.example.com:8813/activedirectory-mcp \
+curl -X POST https://ad-mcp.example.com:8820/mcp \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer YOUR_TOKEN' \
   -d '{
     "jsonrpc": "2.0",
-    "method": "tools/call",
+    "method": "prompts/get",
     "params": {
-      "name": "ad_execute_msp_prompt",
-      "arguments": {
-        "name": "ad_security_audit",
-        "arguments": { "include_disabled": false }
-      }
+      "name": "ad_security_audit",
+      "arguments": { "include_disabled": false }
     },
     "id": 1
   }'
@@ -193,23 +192,23 @@ Expected: instructions to call `ad_create_computer_account("WS01")` first, with 
 ### 5.1 Unknown prompt name
 
 ```bash
-... "name": "ad_execute_msp_prompt", "arguments": { "name": "ad_nonexistent" } ...
+... "method": "prompts/get", "params": { "name": "ad_nonexistent" } ...
 ```
 
-Expected: error response with the list of valid prompt names.
+Expected: a JSON-RPC `error` object (protocol-level failure, e.g. code `-32000`) with message `Prompt não encontrado: ad_nonexistent` &mdash; not a normal `result`.
 
 ### 5.2 Missing required argument
 
 ```bash
-... "name": "ad_execute_msp_prompt", "arguments": { "name": "ad_user_lookup", "arguments": {} } ...
+... "method": "prompts/get", "params": { "name": "ad_user_lookup", "arguments": {} } ...
 ```
 
-Expected: error response naming the missing required argument.
+Expected: a normal `result` (not a JSON-RPC error) whose message text is JSON with `success: false` and an `error` string naming the missing parameter (`search_term`).
 
 ### 5.3 Write tool without confirmation
 
 ```bash
-curl -X POST https://ad-mcp.example.com:8813/activedirectory-mcp \
+curl -X POST https://ad-mcp.example.com:8820/mcp \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer YOUR_TOKEN' \
   -d '{
@@ -238,27 +237,27 @@ Run the same `ad_get_client_tenant_info` request against each tenant endpoint an
 
 ```bash
 # Tenant A
-curl -X POST https://ad-mcp.example.com:8821/activedirectory-mcp \
+curl -X POST https://ad-mcp.example.com:8821/mcp \
   -H 'Authorization: Bearer TOKEN_TENANT_A' \
   -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"ad_get_client_tenant_info","arguments":{}},"id":1}'
 
 # Tenant B
-curl -X POST https://ad-mcp.example.com:8822/activedirectory-mcp \
+curl -X POST https://ad-mcp.example.com:8822/mcp \
   -H 'Authorization: Bearer TOKEN_TENANT_B' \
   -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"ad_get_client_tenant_info","arguments":{}},"id":1}'
 ```
 
-Each instance must return its own slug and domain &mdash; no leakage between tenants.
+Each instance must return its own slug and domain &mdash; no leakage between tenants. This checks the "one process per tenant" (single mode) deployment; for a single `multi`-mode instance serving several directories, run `tests/test_smoke_ao_vivo.py` instead (see [TESTING_GUIDE.md](TESTING_GUIDE.md)).
 
 ---
 
 ## 7. Acceptance checklist
 
-- [ ] Health check passes (`ldap_verified: true`).
-- [ ] `ad_list_msp_prompts` returns 15 prompts in 2 categories.
+- [ ] Health check passes (`ldap_connection: connected`).
+- [ ] `prompts/list` returns all 15 prompts.
 - [ ] All 7 manager prompts return well-formed instructions referencing `ad_*` tools.
 - [ ] All 8 analyst prompts return well-formed instructions referencing `ad_*` tools.
-- [ ] Unknown prompt name returns the prompt catalog in the error.
-- [ ] Required-argument validation rejects empty calls.
+- [ ] Unknown prompt name fails as a JSON-RPC `error`.
+- [ ] Required-argument validation rejects empty calls with a `success: false` result naming the missing argument.
 - [ ] Write protection rejects mutating calls without confirmation/token.
 - [ ] Multi-tenant smoke test returns the correct slug for each port.
